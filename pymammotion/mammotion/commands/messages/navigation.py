@@ -791,6 +791,94 @@ class MessageNavigation(AbstractMessage, ABC):
         logger.debug(f"Send command - Response edgewise mapping action={action}, hash={hash_num}")
         return self.send_order_msg_nav(build)
 
+    # === Task control ===
+
+    def start_mapless_mow(self) -> bytes:
+        """Start a boundary-free mowing job without a pre-recorded zone (x5 models only)."""
+        build = MctlNav(todev_taskctrl=NavTaskCtrl(type=1, action=16, result=0))
+        logger.debug("Send command - Start mapless mow (x5 model)")
+        return self.send_order_msg_nav(build)
+
+    # === Dock / charge pile management ===
+
+    def notify_arrived_at_dock(self) -> bytes:
+        """Notify device that it has positioned itself in front of the charging station."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=22, type=2))
+        logger.debug("Send command - Notify arrived at dock")
+        return self.send_order_msg_nav(build)
+
+    def record_dock_approach(self) -> bytes:
+        """Reset the charging pile position and start recording the return-to-dock approach channel."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=21, type=5))
+        logger.debug("Send command - Record dock approach channel")
+        return self.send_order_msg_nav(build)
+
+    # === Route / dynamics ===
+
+    def get_dynamic_route(self) -> bytes:
+        """Request the current real-time mowing route from the device."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=8, sub_cmd=1, type=18))
+        logger.debug("Send command - Get dynamic route")
+        return self.send_order_msg_nav(build)
+
+    def get_area_count_limit(self, type: int) -> bytes:
+        """Query the maximum number of areas allowed for a given area type (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=24, type=type))
+        logger.debug(f"Send command - Get area count limit type={type}")
+        return self.send_order_msg_nav(build)
+
+    # === Manual mapping (x5 model) ===
+
+    def start_auto_lawn_detection(self) -> bytes:
+        """Begin automatic lawn boundary detection sequence (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=25, type=0))
+        logger.debug("Send command - Start auto lawn detection (x5 model)")
+        return self.send_order_msg_nav(build)
+
+    def manual_mapping_place_stake(self) -> bytes:
+        """Send stake-placement or corridor-recording trigger during manual mapping (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=0, type=27))
+        logger.debug("Send command - Manual mapping place stake / record corridor")
+        return self.send_order_msg_nav(build)
+
+    def manual_mapping_start(self) -> bytes:
+        """Start manual boundary recording at the current position (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=0, type=29))
+        logger.debug("Send command - Manual mapping start")
+        return self.send_order_msg_nav(build)
+
+    def manual_mapping_drive_to_lawn(self) -> bytes:
+        """Command device to drive itself to the lawn area before manual mapping begins (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=0, type=30))
+        logger.debug("Send command - Manual mapping drive to lawn")
+        return self.send_order_msg_nav(build)
+
+    def manual_mapping_close_boundary(self) -> bytes:
+        """Force-seal the open boundary polygon to complete manual mapping (x5 models)."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=0, type=28))
+        logger.debug("Send command - Manual mapping close boundary")
+        return self.send_order_msg_nav(build)
+
+    def set_edgewise_mapping(self, action: int) -> bytes:
+        """Toggle edgewise (boundary-following) mapping mode; action encodes on/off state."""
+        build = MctlNav(todev_get_commondata=NavGetCommData(pver=1, action=action, type=0))
+        logger.debug(f"Send command - Set edgewise mapping action={action}")
+        return self.send_order_msg_nav(build)
+
+    # === Animal avoidance ===
+
+    def read_animal_avoidance(self) -> bytes:
+        """Read the current animal-avoidance configuration from the device."""
+        build = MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=13, rw=0))
+        logger.debug("Send command - Read animal avoidance")
+        return self.send_order_msg_nav(build)
+
+    def set_animal_avoidance(self, context: int) -> bytes:
+        """Write the animal-avoidance setting; ``context`` carries the value to apply."""
+        build = MctlNav(nav_sys_param_cmd=NavSysParamMsg(id=12, context=context, rw=1))
+        logger.debug(f"Send command - Set animal avoidance context={context}")
+        return self.send_order_msg_nav(build)
+
     # === Radar test ===
 
     def radar_test_send(self, cmd: int) -> bytes:

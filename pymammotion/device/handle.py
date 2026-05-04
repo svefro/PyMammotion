@@ -68,9 +68,9 @@ _MQTT_POLL_INTERVAL: dict[_DeviceMode, float] = {
 #: count=1 polls at that cadence.
 _BLE_POLL_INTERVAL: dict[_DeviceMode, float | None] = {
     _DeviceMode.ACTIVE: None,  # continuous stream
-    _DeviceMode.DOCKED_CHARGING: 5 * 60.0,
-    _DeviceMode.DOCKED_FULL: 30 * 60.0,
-    _DeviceMode.IDLE: 15 * 60.0,
+    _DeviceMode.DOCKED_CHARGING: 1 * 60.0,
+    _DeviceMode.DOCKED_FULL: 5 * 60.0,
+    _DeviceMode.IDLE: 5 * 60.0,
 }
 
 #: Channels sent in one-shot (count=1) polls AND in the BLE continuous stream.

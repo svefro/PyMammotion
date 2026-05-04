@@ -14,6 +14,8 @@ from pymammotion.proto import (
     DebugEnableT,
     DebugResCfgAbilityT,
     DeviceProductTypeInfoT,
+    FileTransferResponse,
+    FileTransferResult,
     LoraCfgReq,
     LubaMsg,
     MapInfo,
@@ -34,6 +36,7 @@ from pymammotion.proto import (
     SysCommCmd,
     SysKnifeControl,
     SysSetDateTime,
+    TaskReportInteractionT,
     TimeCtrlLight,
     UserSetBladeUsedWarnTime,
     WallMaterialE,
@@ -608,4 +611,38 @@ class MessageSystem(AbstractMessage, ABC):
                 )
             )
         logger.debug(f"Send command - SP bottom type update bottom_type={bottom_type}, query={is_query}")
+        return self.send_order_msg_sys(build)
+
+    # === Work report ===
+
+    def send_receive_work_report(self, cmd: int = 0) -> bytes:
+        """Signal the device that the app is ready to receive a work-session report.
+
+        Sent before the device begins transmitting the report payload.
+        ``cmd`` is an optional sub-command code (default 0).
+        """
+        build = MctlSys(task_report_interaction=TaskReportInteractionT(cmd=cmd))
+        logger.debug("Send command - Ready to receive work report")
+        return self.send_order_msg_sys(build)
+
+    def send_complete_report(self, biz_id: str, result: int) -> bytes:
+        """Acknowledge receipt of a complete work-session report.
+
+        ``biz_id`` is the business-transaction identifier returned by the device
+        in the report header.  ``result`` is 0 for success, non-zero for error.
+        """
+        build = MctlSys(task_report_result=FileTransferResult(biz_id=biz_id, result=result))
+        logger.debug(f"Send command - Complete report biz_id={biz_id}, result={result}")
+        return self.send_order_msg_sys(build)
+
+    def send_confirm_report(self, biz_id: str, result: int, progress: int) -> bytes:
+        """Confirm a partial or complete report transfer frame.
+
+        ``biz_id`` identifies the transfer session; ``result`` is the per-frame
+        error code (0 = OK); ``progress`` is the transfer progress percentage.
+        """
+        build = MctlSys(
+            task_report_resp=FileTransferResponse(biz_id=biz_id, result=result, progress=progress)
+        )
+        logger.debug(f"Send command - Confirm report biz_id={biz_id}, result={result}, progress={progress}")
         return self.send_order_msg_sys(build)

@@ -58,7 +58,7 @@ _BLE_MODE_RECHECK_INTERVAL: float = 30.0
 
 #: MQTT one-shot (count=1) poll cadence per device mode.  Tuned for cloud quotas.
 _MQTT_POLL_INTERVAL: dict[_DeviceMode, float] = {
-    _DeviceMode.ACTIVE: 15 * 60.0,
+    _DeviceMode.ACTIVE: 20 * 60.0,
     _DeviceMode.DOCKED_CHARGING: 30 * 60.0,
     _DeviceMode.DOCKED_FULL: 60 * 60.0,
     _DeviceMode.IDLE: 15 * 60.0,
@@ -255,6 +255,11 @@ class DeviceHandle:
         #: True while the BLE continuous (count=0) report stream is active.  The MQTT
         #: activity loop checks this and skips its own poll while the stream is feeding.
         self._ble_stream_active: bool = False
+        #: Monotonic timestamp of the last successfully-parsed inbound LubaMsg.
+        #: Used by ensure_fresh_state to decide whether a snapshot poll is needed.
+        self._last_report_at: float = 0.0
+        #: Timer handle for the transient continuous-stream auto-stop.
+        self._report_stream_timer: asyncio.TimerHandle | None = None
 
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
@@ -408,6 +413,7 @@ class DeviceHandle:
             return
 
         _logger.debug("← %s  %s", self.device_name, luba_msg.to_dict(include_default_values=False))
+        self._last_report_at = time.monotonic()
 
         if self._availability.mqtt_reported_offline and transport_type != TransportType.BLE:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
@@ -742,6 +748,9 @@ class DeviceHandle:
     async def stop(self) -> None:
         """Stop the command queue, broker, debounce task, and disconnect all transports."""
         self._stopping = True
+        if self._report_stream_timer is not None:
+            self._report_stream_timer.cancel()
+            self._report_stream_timer = None
         for task in (self._keep_alive_task, self._ble_keep_alive_task, self._ble_polling_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -819,6 +828,118 @@ class DeviceHandle:
         See ``_MQTT_POLL_INTERVAL`` for the per-mode cadence table.
         """
         return _MQTT_POLL_INTERVAL[self._device_mode()]
+
+    # ------------------------------------------------------------------
+    # Public report-cfg API (used by MammotionClient / HA via client.py)
+    # ------------------------------------------------------------------
+
+    @property
+    def last_report_at(self) -> float:
+        """Monotonic timestamp of the last received LubaMsg (0.0 if none yet)."""
+        return self._last_report_at
+
+    async def request_report_snapshot(self) -> None:
+        """Fire a one-shot count=1 report — no-op while BLE continuous stream is active.
+
+        Used by HA after state-changing commands and in the sys_status watcher.
+        Safe to call at any time; skips silently if BLE is already streaming fresher data.
+        """
+        if self._ble_stream_active:
+            return
+        await self._send_one_shot_report()
+
+    async def start_report_stream(self, duration_ms: int = 300_000) -> None:
+        """Start a transient report window lasting ``duration_ms`` ms.
+
+        If the device is actively mowing or returning (ACTIVE mode), starts a
+        continuous (count=0) stream and arms a stop timer.  In any other mode
+        (docked, idle) a single one-shot count=1 poll is issued instead — there
+        is no point holding a continuous stream for a stationary device.
+
+        For the continuous path:
+        * Repeated calls within the window reset the timer without re-sending
+          RPT_START (prevents cloud quota spam on frequent callers like a dashboard).
+        * If the BLE polling loop already holds a continuous stream the RPT_START
+          is skipped (data already flowing) but the timer is still armed.
+        * The stop callback skips RPT_STOP if BLE is still streaming so the BLE
+          polling loop is never interrupted mid-run.
+        """
+        if self._device_mode() != _DeviceMode.ACTIVE:
+            await self.request_report_snapshot()
+            return
+
+        already_streaming = self._report_stream_timer is not None
+
+        if self._report_stream_timer is not None:
+            self._report_stream_timer.cancel()
+            self._report_stream_timer = None
+
+        if not self._ble_stream_active:
+            if already_streaming:
+                await self._send_report_stream_keep()
+            else:
+                await self._send_report_stream_start(duration_ms)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._report_stream_timer = loop.call_later(duration_ms / 1000, self._fire_report_stream_stop)
+
+    def _fire_report_stream_stop(self) -> None:
+        """Sync timer callback — creates the async stop task."""
+        self._report_stream_timer = None
+        if self._ble_stream_active:
+            # BLE loop is still streaming (mowing/idle); let it manage its own teardown.
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._send_report_stream_stop())
+        except RuntimeError:
+            pass
+
+    async def _send_report_stream_start(self, duration_ms: int) -> None:
+        """Enqueue RPT_START count=0 via best transport."""
+        cmd_bytes = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_START,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=duration_ms,
+            period=1000,
+            no_change_period=4000,
+            count=0,
+        )
+
+        async def _send() -> None:
+            await self.send_raw(cmd_bytes)
+
+        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
+
+    async def _send_report_stream_keep(self) -> None:
+        """Enqueue RPT_KEEP to refresh an already-active continuous stream."""
+        cmd_bytes = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_KEEP,
+            rpt_info_type=_REPORT_CHANNELS,
+            count=0,
+        )
+
+        async def _send() -> None:
+            await self.send_raw(cmd_bytes)
+
+        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
+
+    async def _send_report_stream_stop(self) -> None:
+        """Enqueue RPT_STOP count=1 to tear down the continuous stream."""
+        cmd_bytes = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_STOP,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=10_000,
+            count=1,
+        )
+
+        async def _send() -> None:
+            await self.send_raw(cmd_bytes)
+
+        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
     async def _send_one_shot_report(self) -> None:
         """Enqueue a one-shot ``request_iot_sys(count=1)`` data refresh.

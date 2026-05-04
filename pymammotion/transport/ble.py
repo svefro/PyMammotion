@@ -32,9 +32,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# How long to wait after the last command before dropping the idle BLE connection.
-_DISCONNECT_DELAY = 10
-
 
 @dataclass(frozen=True)
 class BLETransportConfig:
@@ -89,8 +86,6 @@ class BLETransport(Transport):
         self._client: BleakClientWithServiceCache | None = None
         self._message: BleMessage | None = None
         self._availability: TransportAvailability = TransportAvailability.DISCONNECTED
-        self._disconnect_on_idle: bool = True
-        self._idle_disconnect_timer: asyncio.TimerHandle | None = None
         # Captured at connect() so disconnect callbacks (which may run on a non-asyncio
         # thread inside bleak's backend) can schedule async work safely.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -159,15 +154,6 @@ class BLETransport(Transport):
         if self._ble_device is None:
             return False
         return time.monotonic() >= self._connect_cooldown_until
-
-    def set_disconnect_strategy(self, *, disconnect: bool = True) -> None:
-        """Set whether the BLE connection should be dropped when the device is idle.
-
-        When disconnect=True (default) the transport will disconnect after
-        commands complete, reducing power consumption.  When disconnect=False
-        the connection is kept alive (suitable for stay-connected-Bluetooth mode).
-        """
-        self._disconnect_on_idle = disconnect
 
     # ------------------------------------------------------------------
     # Transport ABC
@@ -257,8 +243,6 @@ class BLETransport(Transport):
         await self._notify_availability(TransportAvailability.CONNECTED)
         _logger.debug("BLETransport connected to %s", self._config.device_id)
 
-        # Clear any stale idle-disconnect timer from a previous session.
-        self._cancel_idle_disconnect_timer()
         # Successful connect resets the failure tracker.
         self._consecutive_failures = 0
 
@@ -328,7 +312,6 @@ class BLETransport(Transport):
 
     async def disconnect(self) -> None:
         """Gracefully disconnect the BLE client."""
-        self._cancel_idle_disconnect_timer()
         if self._client is not None and self._client.is_connected:
             await self._client.disconnect()
         self._client = None
@@ -354,24 +337,8 @@ class BLETransport(Transport):
             raise TransportError(f"BLE send failed for {self._config.device_id!r}: client disconnected during write")
 
     async def send(self, payload: bytes, iot_id: str = "") -> None:
-        """Frame and write payload via the BleMessage codec, then reset the idle-disconnect timer.
-
-        Use this for real user commands.  For keepalive heartbeats use
-        ``send_heartbeat()`` so the idle-disconnect timer is not disturbed.
-        """
+        """Frame and write payload via the BleMessage codec."""
         _logger.debug("Sending BLE payload: %s, %s iot_id", payload, iot_id)
-        await self._write_payload(payload)
-        self._reset_idle_disconnect_timer()
-
-    async def send_heartbeat(self, payload: bytes, iot_id: str = "") -> None:
-        """Write a keepalive heartbeat without resetting the idle-disconnect timer.
-
-        When ``stay_connected_bluetooth=False`` the idle-disconnect timer must
-        only be reset by genuine user commands, not by periodic ble_sync pings.
-        Calling ``send()`` for heartbeats would perpetually postpone the timer
-        and prevent the idle-disconnect from ever firing.
-        """
-        _logger.debug("Sending BLE heartbeat %s iot_id", iot_id)
         await self._write_payload(payload)
 
     # ------------------------------------------------------------------
@@ -428,55 +395,6 @@ class BLETransport(Transport):
 
         if payload and self.on_message is not None:
             await self.on_message(bytes(payload))
-
-    # ------------------------------------------------------------------
-    # Idle disconnect
-    # ------------------------------------------------------------------
-
-    def _reset_idle_disconnect_timer(self) -> None:
-        """(Re)start the idle-disconnect countdown after a send completes."""
-        if not self._disconnect_on_idle:
-            return
-        self._cancel_idle_disconnect_timer()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._idle_disconnect_timer = loop.call_later(_DISCONNECT_DELAY, self._disconnect_from_idle_timer)
-
-    def _cancel_idle_disconnect_timer(self) -> None:
-        """Cancel the pending idle-disconnect timer, if any."""
-        if self._idle_disconnect_timer is not None:
-            self._idle_disconnect_timer.cancel()
-            self._idle_disconnect_timer = None
-
-    def _disconnect_from_idle_timer(self) -> None:
-        """Timer callback: disconnect if idle, or reschedule if a send is in flight."""
-        if self._operation_lock.locked() and self.is_connected:
-            # A send is still in progress — postpone until it finishes.
-            _logger.debug(
-                "BLETransport: send in progress for %s — deferring idle disconnect",
-                self._config.device_id,
-            )
-            self._reset_idle_disconnect_timer()
-            return
-        self._cancel_idle_disconnect_timer()
-        try:
-            loop = asyncio.get_running_loop()
-            _task = loop.create_task(self._execute_idle_disconnect())
-        except RuntimeError:
-            pass
-
-    async def _execute_idle_disconnect(self) -> None:
-        """Disconnect the idle BLE connection (respects disconnect_on_idle flag)."""
-        if not self._disconnect_on_idle:
-            return
-        _logger.debug(
-            "BLETransport: idle timeout — disconnecting %s after %ss",
-            self._config.device_id,
-            _DISCONNECT_DELAY,
-        )
-        await self.disconnect()
 
     # ------------------------------------------------------------------
     # BLE keepalive sync

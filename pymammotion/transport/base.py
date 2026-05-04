@@ -376,7 +376,7 @@ class Transport(ABC):
 
         The default delegates to ``send()``.  MQTT transports override this to
         skip ``record_send()`` so periodic ble_sync pings don't burn the 300-sends/24 h
-        budget.  BLETransport overrides it to skip resetting the idle-disconnect timer.
+        budget.
         """
         await self.send(payload, iot_id=iot_id)
 

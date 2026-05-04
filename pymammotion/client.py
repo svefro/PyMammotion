@@ -44,6 +44,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT, AccountRegistry, AccountSession
@@ -309,6 +310,39 @@ class MammotionClient:
             rpt_info_type=_CONTINUOUS_STREAM_CHANNELS,
             count=1,
         )
+
+    async def request_report_snapshot(self, device_name: str) -> None:
+        """Fire a one-shot count=1 report, skipped if the BLE stream is already active.
+
+        Use after state-changing commands or on state-change watchers to get a fresh
+        snapshot without fighting an in-progress BLE continuous feed.
+        """
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is not None:
+            await handle.request_report_snapshot()
+
+    async def start_report_stream(self, device_name: str, duration_ms: int = 300_000) -> None:
+        """Start a transient count=0 continuous report window lasting ``duration_ms`` ms.
+
+        Repeated calls reset the window.  Safe to call while BLE is streaming —
+        the RPT_START is skipped but the stop timer is still armed.
+        """
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is not None:
+            await handle.start_report_stream(duration_ms)
+
+    async def ensure_fresh_state(self, device_name: str, *, max_age_s: float = 120.0) -> None:
+        """Fire a one-shot snapshot if the last inbound report is older than ``max_age_s`` seconds.
+
+        Intended for use at the top of user-action handlers (start/dock/pause/cancel)
+        to avoid acting on stale state after a long idle period.  Fire-and-forget:
+        the response arrives asynchronously.
+        """
+        handle = self._device_registry.get_by_name(device_name)
+        if handle is None:
+            return
+        if time.monotonic() - handle.last_report_at > max_age_s:
+            await handle.request_report_snapshot()
 
     def subscribe_device_status(
         self,
@@ -1763,17 +1797,12 @@ class MammotionClient:
         self,
         device_name: str,
         ble_device: BLEDevice,
-        *,
-        disconnect_on_idle: bool = True,
     ) -> None:
         """Attach (or replace) a BLE transport on an already-registered device.
 
         Args:
-            device_name:        Registered device name.
-            ble_device:         The bleak ``BLEDevice`` to use for the BLE connection.
-            disconnect_on_idle: When True, the BLE connection is dropped when the
-                                device is idle (power-saving).  Set to False for
-                                stay-connected Bluetooth mode.
+            device_name: Registered device name.
+            ble_device:  The bleak ``BLEDevice`` to use for the BLE connection.
 
         """
         handle = self._device_registry.get_by_name(device_name)
@@ -1783,11 +1812,9 @@ class MammotionClient:
         if handle.has_transport(TransportType.BLE) and (bleTransport := handle.get_transport(TransportType.BLE)):
             _logger.debug("add_ble_to_device: device '%s' already has BLE transport", device_name)
             cast(BLETransport, bleTransport).set_ble_device(ble_device)
-            cast(BLETransport, bleTransport).set_disconnect_strategy(disconnect=disconnect_on_idle)
             return
         transport = BLETransport(BLETransportConfig(device_id=device_name))
         transport.set_ble_device(ble_device)
-        transport.set_disconnect_strategy(disconnect=disconnect_on_idle)
         await handle.add_transport(transport)
 
     async def get_stream_subscription(self, device_name: str, iot_id: str) -> Any:

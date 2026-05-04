@@ -183,7 +183,7 @@ class DeviceCommandQueue:
                 _gateway_timeout_max = 3
                 for _attempt in range(1, _gateway_timeout_max + 1):
                     try:
-                        await item.work()  # type: ignore[misc]
+                        await item.work()
                         break  # success — exit retry loop
                     except GatewayTimeoutException:
                         if _attempt < _gateway_timeout_max:

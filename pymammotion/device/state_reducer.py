@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import betterproto2
@@ -973,7 +974,12 @@ class RTKStateReducer(StateReducer):
                 coord = json.loads(coord_prop.value)
                 # The coordinate property is already in radians (protocol-level unit).
                 if (lat := coord.get("lat")) and lat != 0:
-                    device.lat = float(coord["lat"])
+                    raw_lat = float(lat)
+                    # a1Nc68bGZzX devices report latitude 436 radians low; guard
+                    # on out-of-range so a firmware fix doesn't keep shifting it.
+                    if current.product_key == "a1Nc68bGZzX" and abs(raw_lat) > math.pi / 2:
+                        raw_lat += 436
+                    device.lat = raw_lat
                 if (lon := coord.get("lon")) and lon != 0:
                     device.lon = float(coord["lon"])
             except (ValueError, KeyError, TypeError):

@@ -45,6 +45,7 @@ from pymammotion.data.model.hash_list import (
     MowPath,
     MowPathPacket,
     NavGetCommData,
+    SvgMessage,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,31 @@ VISUAL_OBSTACLE_ZONE_STYLE = {
     "lineJoin": "round",
 }
 
+# PathType 13 — SVG map tile overlay.  Enabled tiles use a solid purple
+# outline with a light fill; disabled (hide_svg=True) tiles are drawn with
+# a dashed outline and no fill so they remain visible but clearly inactive.
+SVG_ENABLED_STYLE = {
+    "color": "#9B59B6",
+    "fillColor": "#9B59B6",
+    "weight": 2,
+    "opacity": 0.9,
+    "fillOpacity": 0.2,
+    "dashArray": "",
+    "lineCap": "round",
+    "lineJoin": "round",
+}
+
+SVG_DISABLED_STYLE = {
+    "color": "#9B59B6",
+    "fillColor": "none",
+    "weight": 2,
+    "opacity": 0.6,
+    "fillOpacity": 0.0,
+    "dashArray": "6, 5",
+    "lineCap": "round",
+    "lineJoin": "round",
+}
+
 geojson_metadata = {"name": "Lawn Areas", "description": "Generated from Mammotion diagnostics data"}
 
 # Map type IDs — these match PathType enum values from NavGetCommData.type
@@ -242,6 +268,7 @@ TYPE_PATH: int = 2
 TYPE_CORRIDOR_LINE: int = 19
 TYPE_CORRIDOR_POINT: int = 20
 TYPE_VIRTUAL_WALL: int = 21
+TYPE_SVG: int = 13
 TYPE_VISUAL_SAFETY_ZONE: int = 25
 TYPE_VISUAL_OBSTACLE_ZONE: int = 26
 
@@ -294,6 +321,7 @@ class GeojsonGenerator:
         geo_json: GeoJSONCollection = {"type": "FeatureCollection", "name": "Lawn Areas", "features": []}
         GeojsonGenerator._add_rtk_and_dock(rtk_location, dock_location, dock_rotation, geo_json)
         total_frames = GeojsonGenerator._process_map_objects(hash_list, rtk_location, area_names, geo_json, yaw=yaw)
+        GeojsonGenerator._process_svg_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
 
         # _save_geojson(geo_json)
         return geo_json
@@ -678,10 +706,81 @@ class GeojsonGenerator:
         return total_frames
 
     @staticmethod
-    def _process_svg_map_objects(hash_list: HashList, rtk_location: Point, geo_json: GeoJSONCollection) -> None:
-        """Process all SVG map objects and add them to GeoJSON."""
+    def _svg_bounding_box(svg: SvgMessage, yaw: float) -> list[CommDataCouple]:
+        """Return the four corners of an SVG tile's rotated bounding box in device-local ENU metres.
+
+        The box is centred at (x_move, y_move), has physical dimensions
+        (base_width_m × scale, base_height_m × scale), and is rotated by
+        ``svg.svg_message.rotate`` within the device frame.  The map yaw is
+        NOT applied here — ``_convert_to_lonlat_coords`` handles that.
+        """
+        msg = svg.svg_message
+        scale = msg.scale if msg.scale > 0 else 1.0
+        hw = msg.base_width_m * scale / 2
+        hh = msg.base_height_m * scale / 2
+        r = msg.rotate
+        cos_r = math.cos(r)
+        sin_r = math.sin(r)
+
+        # Unrotated corners (CCW from bottom-left)
+        raw = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        return [
+            CommDataCouple(
+                x=cx * cos_r - cy * sin_r + msg.x_move,
+                y=cx * sin_r + cy * cos_r + msg.y_move,
+            )
+            for cx, cy in raw
+        ]
+
+    @staticmethod
+    def _process_svg_map_objects(
+        hash_list: HashList, rtk_location: Point, geo_json: GeoJSONCollection, yaw: float = 0.0
+    ) -> None:
+        """Convert SVG tile overlays to GeoJSON Polygon features.
+
+        Each SVG is represented as its rotated bounding box.  The style
+        reflects whether the tile is currently enabled or hidden:
+
+        - ``hide_svg=False`` → solid outline + light fill (enabled)
+        - ``hide_svg=True``  → dashed outline, no fill (disabled)
+        """
         for hash_key, frame_list in hash_list.svg.items():
-            logger.debug(hash_key, frame_list)
+            # Use the last frame; there is typically only one.
+            svg_frame: SvgMessage | None = None
+            for frame in frame_list.data:
+                if isinstance(frame, SvgMessage):
+                    svg_frame = frame
+
+            if svg_frame is None:
+                continue
+
+            corners = GeojsonGenerator._svg_bounding_box(svg_frame, yaw)
+            lonlat_coords = GeojsonGenerator._convert_to_lonlat_coords(corners, rtk_location, yaw=yaw)
+            # Close the polygon ring
+            if lonlat_coords and lonlat_coords[0] != lonlat_coords[-1]:
+                lonlat_coords.append(lonlat_coords[0])
+
+            style = SVG_DISABLED_STYLE if svg_frame.svg_message.hide_svg else SVG_ENABLED_STYLE
+            properties: dict[str, Any] = {
+                "hash": hash_key,
+                "type_name": "svg",
+                "type_id": TYPE_SVG,
+                "title": svg_frame.svg_message.svg_file_name or f"SVG {hash_key}",
+                "Name": svg_frame.svg_message.svg_file_name or f"SVG {hash_key}",
+                "description": "SVG map tile overlay",
+                "parent_hash_a": svg_frame.paternal_hash_a,
+                "hide_svg": svg_frame.svg_message.hide_svg,
+                "scale": svg_frame.svg_message.scale,
+                "rotate": svg_frame.svg_message.rotate,
+                **style,
+            }
+            geo_json["features"].append(
+                {
+                    "type": "Feature",
+                    "properties": properties,
+                    "geometry": {"type": "Polygon", "coordinates": [lonlat_coords]},
+                }
+            )
 
     @staticmethod
     def _validate_frame_list(frame_list: FrameList, hash_key: int, area_names: dict[int, str] | None = None) -> bool:

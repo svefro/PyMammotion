@@ -979,9 +979,13 @@ class RTKStateReducer(StateReducer):
                     # guard on out-of-range so a firmware fix doesn't keep shifting it.
                     if current.product_key == "a1Nc68bGZzX" and abs(raw_lat) > math.pi / 2:
                         raw_lat += math.radians(436)
+
                     device.lat = raw_lat
                 if (lon := coord.get("lon")) and lon != 0:
-                    device.lon = float(coord["lon"])
+                    raw_lon = float(lon)
+                    if current.product_key == "a1Nc68bGZzX" and abs(raw_lon) > math.pi / 2:
+                        raw_lon += math.radians(436)
+                    device.lon = raw_lon
             except (ValueError, KeyError, TypeError):
                 _logger.debug("RTKStateReducer: failed to parse coordinate property")
 

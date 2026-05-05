@@ -114,6 +114,8 @@ class MowPathSaga(Saga):
                 try:
                     ack_response = await asyncio.wait_for(hash_ack_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
+                    cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+                    await self._send_command(cmd)
                     if _total_frame == 0:
                         _logger.warning(
                             "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)",

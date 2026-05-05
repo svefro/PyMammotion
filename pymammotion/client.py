@@ -41,6 +41,7 @@ Two flavours of caller-provided BLE info are supported:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -137,6 +138,10 @@ class MammotionClient:
         # RAII subscriptions for state-change watchers (keyed by device_name)
         self._watcher_subscriptions: dict[str, list[Subscription]] = {}
         self._ha_version: str | None = ha_version
+        #: Fired when all automatic auth recovery attempts (relogin, token refresh,
+        #: reconnect) have been exhausted and human intervention is required.
+        #: HA-Luba wires this to ``entry.async_start_reauth()``.
+        self.on_unrecoverable_auth_error: Callable[[Exception], Awaitable[None]] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -158,8 +163,7 @@ class MammotionClient:
     def remove_device(self, name: str) -> None:
         """Schedule removal of the named device (fire-and-forget async task)."""
         loop = asyncio.get_event_loop()
-        handle = self._device_registry.get_by_name(name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(name):
             task = loop.create_task(self._device_registry.unregister(handle.device_id))
             del task  # RUF006: reference held briefly to satisfy linter, task is fire-and-forget
 
@@ -317,9 +321,13 @@ class MammotionClient:
         Use after state-changing commands or on state-change watchers to get a fresh
         snapshot without fighting an in-progress BLE continuous feed.
         """
-        handle = self._device_registry.get_by_name(device_name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(device_name):
             await handle.request_report_snapshot()
+
+    async def request_reports(self, device_name: str, *, count: int = 1, timeout: int = 10000) -> None:
+        """Fire a one-shot count=count report, skipped if the BLE stream is already active."""
+        if handle := self._device_registry.get_by_name(device_name):
+            await handle.request_reports(count=count, timeout=timeout)
 
     async def start_report_stream(self, device_name: str, duration_ms: int = 300_000) -> None:
         """Start a transient count=0 continuous report window lasting ``duration_ms`` ms.
@@ -327,8 +335,7 @@ class MammotionClient:
         Repeated calls reset the window.  Safe to call while BLE is streaming —
         the RPT_START is skipped but the stop timer is still armed.
         """
-        handle = self._device_registry.get_by_name(device_name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(device_name):
             await handle.start_report_stream(duration_ms)
 
     async def ensure_fresh_state(self, device_name: str, *, max_age_s: float = 120.0) -> None:
@@ -1072,28 +1079,58 @@ class MammotionClient:
         token_manager = acct_session.token_manager
 
         async def _on_aliyun_auth_failure() -> bool:
-            """Refresh Aliyun IoT credentials and update the bind token on the transport."""
+            """Handle a 2043 bind rejection by performing a full re-login.
+
+            A 2043 means the current iotToken is invalid.  Rather than attempting a
+            targeted Aliyun credential refresh first (which risks looping when the
+            refreshToken is also stale — 2401), we go straight to a full email/password
+            re-login so fresh credentials are obtained in one step.
+            """
             if token_manager is None:
                 return False
+            _logger.warning("Aliyun bind rejected (2043) — performing full re-login")
             try:
-                await token_manager.refresh_aliyun_credentials()
+                await self._full_relogin(acct_session)
+                # force_refresh → _refresh_aliyun fires on_aliyun_token_refreshed which
+                # updates the transport via callback.  Explicitly push here as a safety
+                # net in case _cloud_gateway was None and _refresh_aliyun was skipped.
                 creds = await token_manager.get_aliyun_credentials()
                 transport.update_iot_token(creds.iot_token)
-                _logger.info("Aliyun IoT token refreshed after bind token expiry")
+                _logger.info("Aliyun IoT token refreshed after full re-login")
                 return True
-            except ReLoginRequiredError:
-                _logger.warning("Aliyun token refresh requires full re-login — attempting")
-                try:
-                    await self._full_relogin(acct_session)
-                    creds = await token_manager.get_aliyun_credentials()
-                    transport.update_iot_token(creds.iot_token)
-                    _logger.info("Aliyun IoT token refreshed after full re-login")
-                    return True
-                except Exception:
-                    _logger.exception("Full re-login failed after Aliyun bind token expiry")
-                    return False
+            except Exception as exc:
+                _logger.exception("Full re-login failed after Aliyun bind token expiry")
+                raise ReLoginRequiredError(
+                    acct_session.email if acct_session else "",
+                    f"Full re-login failed after Aliyun bind rejection: {exc}",
+                ) from exc
 
         transport.on_auth_failure = _on_aliyun_auth_failure
+
+        # When on_auth_failure itself fails (full re-login exhausted), the
+        # transport raises ReLoginRequiredError and fires this callback.
+        # Mirror the Mammotion MQTT pattern: attempt a final full re-login
+        # and reconnect so the integration can recover without user action.
+        async def _on_aliyun_fatal_auth(exc: ReLoginRequiredError) -> None:
+            _logger.warning("Aliyun transport fatal auth error — attempting final re-login: %s", exc)
+            try:
+                await self._full_relogin(acct_session)
+                # Same safety net: explicit push in case callback path was skipped.
+                if token_manager is not None:
+                    creds = await token_manager.get_aliyun_credentials()
+                    transport.update_iot_token(creds.iot_token)
+                # Schedule connect() for after the current _run() task exits.
+                # Calling it directly here is a no-op because the task is still running.
+                asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(transport.connect()))
+                _logger.info("Aliyun transport reconnect scheduled after final re-login")
+            except Exception as relogin_exc:
+                _logger.exception("Final re-login failed for Aliyun transport — user must re-authenticate")
+                if self.on_unrecoverable_auth_error is not None:
+                    with contextlib.suppress(Exception):
+                        await self.on_unrecoverable_auth_error(relogin_exc)
+
+        transport.on_fatal_auth_error = _on_aliyun_fatal_auth
+
         # Keep the transport's bind token current on every proactive refresh so that
         # reconnects after a network blip don't carry a stale iotToken.
         if token_manager is not None:
@@ -1138,13 +1175,16 @@ class MammotionClient:
             _logger.warning("MQTT transport fatal auth error — attempting full re-login: %s", exc)
             try:
                 await self._full_relogin(acct_session)
-                # Update the transport config with the fresh JWT and reconnect.
                 new_jwt = await _refresh_jwt()
                 transport.update_jwt(new_jwt)
-                await transport.connect()
-                _logger.info("MQTT transport reconnected after full re-login")
-            except Exception:
+                # Schedule connect() for after the current _run() task exits.
+                asyncio.get_running_loop().call_soon(lambda: asyncio.ensure_future(transport.connect()))
+                _logger.info("MQTT transport reconnect scheduled after full re-login")
+            except Exception as relogin_exc:
                 _logger.exception("Full re-login failed for MQTT transport")
+                if self.on_unrecoverable_auth_error is not None:
+                    with contextlib.suppress(Exception):
+                        await self.on_unrecoverable_auth_error(relogin_exc)
 
         transport.on_fatal_auth_error = _on_fatal_auth
         return transport
@@ -1478,8 +1518,7 @@ class MammotionClient:
         Map data is automatically applied to device state as messages arrive.
         """
 
-        handle = self._device_registry.get_by_name(device_name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(device_name):
             commands = handle.commands
             transport = handle.active_transport()
             _iot_id = handle.iot_id
@@ -1834,8 +1873,7 @@ class MammotionClient:
         is_yuka = DeviceType.is_yuka(device_name)
         subscription = await http.get_stream_subscription(iot_id, is_yuka)
 
-        handle = self._device_registry.get_by_name(device_name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(device_name):
             try:
                 new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None
             except AttributeError:
@@ -1863,8 +1901,7 @@ class MammotionClient:
         is_yuka = DeviceType.is_yuka(device_name)
         subscription = await http.get_stream_subscription(iot_id, is_yuka)
 
-        handle = self._device_registry.get_by_name(device_name)
-        if handle is not None:
+        if handle := self._device_registry.get_by_name(device_name):
             try:
                 new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None
             except AttributeError:

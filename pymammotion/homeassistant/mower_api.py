@@ -164,8 +164,7 @@ class HomeAssistantMowerApi:
         if handle is None:
             logger.error("update_firmware: device '%s' not found", device_name)
             return
-        device = self._mammotion.get_device_by_name(device_name)
-        if device is not None:
+        if device := self._mammotion.get_device_by_name(device_name):
             device.clear_version_info()
         http = self._mammotion.cloud_http
         if http is not None:
@@ -392,8 +391,7 @@ class HomeAssistantMowerApi:
         device.map.generated_mow_path_geojson on completion.
         """
         if not operation_settings.areas:
-            device = self._mammotion.get_device_by_name(device_name)
-            if device is not None:
+            if device := self._mammotion.get_device_by_name(device_name):
                 operation_settings.areas = list(dict.fromkeys(device.map.area.keys()))
         route_information = self.generate_route_information(device_name, operation_settings)
         await self._mammotion.start_mow_path_saga(

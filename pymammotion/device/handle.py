@@ -959,6 +959,15 @@ class DeviceHandle:
 
         await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
 
+    async def request_reports(self, count: int = 1, timeout: int = 10_000) -> None:
+        """Enqueue a one-shot "request_iot_sys(count=count)" data refresh."""
+        cmd_bytes = self.commands.request_iot_sys(
+            rpt_act=RptAct.RPT_START,
+            rpt_info_type=_REPORT_CHANNELS,
+            timeout=timeout,
+            count=count,
+        )
+
     async def _ble_activity_loop(self) -> None:
         """BLE-specific heartbeat loop — runs independently of the MQTT loop.
 

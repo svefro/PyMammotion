@@ -9,7 +9,9 @@ from enum import IntEnum
 import logging
 from typing import TYPE_CHECKING
 
+from pymammotion.aliyun.exceptions import DeviceOfflineException, TooManyRequestsException
 from pymammotion.transport import TransportError
+from pymammotion.transport.base import AuthError, NoTransportAvailableError, SagaFailedError, TransportRateLimitedError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -205,14 +207,6 @@ class DeviceCommandQueue:
                 # so CancelledError here always means we are shutting down.
                 break
             except Exception as exc:
-                from pymammotion.aliyun.exceptions import DeviceOfflineException, TooManyRequestsException
-                from pymammotion.transport.base import (
-                    AuthError,
-                    NoTransportAvailableError,
-                    SagaFailedError,
-                    TransportRateLimitedError,
-                )
-
                 # Expected during transport churn — quiet by default.  Recovery
                 # is automatic: mqtt_reported_offline clears on inbound frames,
                 # BLE rearms via the availability listener.  No retry loop or

@@ -623,7 +623,19 @@ class MessageNavigation(AbstractMessage, ABC):
         return self.send_order_msg_nav(build)
 
     def send_svg_data(self, svg_message: SvgMessage) -> bytes:
-        """Send SVG data to the device."""
+        """Send an SVG map-tile command to the device.
+
+        ``svg_message.sub_cmd`` controls the operation:
+
+        - ``1`` — **add** a new SVG tile (first send for a given ``data_hash``)
+        - ``3`` — **update** an existing tile (same ``data_hash``, new transform)
+        - ``6`` — **delete** a tile by ``data_hash``
+
+        ``svg_message.paternal_hash_a`` must be set to the hash of the parent
+        mowing area so the device knows which zone the tile belongs to.
+        ``data_hash`` is the unique identifier for this tile; reuse the same
+        value across add/update/delete calls for the same shape.
+        """
         build = MctlNav(
             todev_svg_msg=SvgMessageAckT(
                 pver=1,

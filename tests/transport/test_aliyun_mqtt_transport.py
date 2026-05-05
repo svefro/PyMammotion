@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pymammotion.transport.aliyun_mqtt import AliyunMQTTConfig, AliyunMQTTTransport
-from pymammotion.transport.base import AuthError, ReLoginRequiredError, TransportError, TransportType
+from pymammotion.transport.base import ReLoginRequiredError, TransportError, TransportType
 
 
 # ---------------------------------------------------------------------------
@@ -430,11 +430,11 @@ async def test_thing_status_offline_routes_to_on_device_status(
 
 @pytest.mark.asyncio
 async def test_auth_error_raises_and_stops_reconnect(config: AliyunMQTTConfig, cloud_gateway: MagicMock) -> None:
-    """rc=4/5 from the broker should raise AuthError and stop the connection loop."""
+    """rc=4/5 from the broker should raise ReLoginRequiredError and stop the connection loop."""
     transport = AliyunMQTTTransport(config, cloud_gateway)
 
     with patch("aiomqtt.Client", return_value=_AuthFailMQTTClient()):
-        with pytest.raises(AuthError):
+        with pytest.raises(ReLoginRequiredError):
             await transport.connect()
             if transport._task is not None:
                 await transport._task
@@ -599,31 +599,31 @@ def _bind_reply_msg(code: int) -> _FakeMessage:
 
 
 @pytest.mark.asyncio
-async def test_bind_reply_2043_no_callback_raises_auth_error(
+async def test_bind_reply_2043_no_callback_raises_relogin_required(
     config: AliyunMQTTConfig, cloud_gateway: MagicMock
 ) -> None:
-    """bind_reply 2043 with no on_auth_failure wired → AuthError propagates out of _run()."""
+    """bind_reply 2043 with no on_auth_failure → ReLoginRequiredError propagates out of _run()."""
     transport = AliyunMQTTTransport(config, cloud_gateway)
     fake_client = _FakeMQTTClient(messages=[_bind_reply_msg(2043)])
 
     with patch("aiomqtt.Client", return_value=fake_client):
-        with pytest.raises(AuthError):
+        with pytest.raises(ReLoginRequiredError):
             await transport._run()
 
     assert transport._stop_event.is_set()
 
 
 @pytest.mark.asyncio
-async def test_bind_reply_2043_callback_returns_false_raises_auth_error(
+async def test_bind_reply_2043_callback_returns_false_raises_relogin_required(
     config: AliyunMQTTConfig, cloud_gateway: MagicMock
 ) -> None:
-    """bind_reply 2043 → on_auth_failure returns False → AuthError propagates."""
+    """bind_reply 2043 → on_auth_failure returns False → ReLoginRequiredError propagates."""
     transport = AliyunMQTTTransport(config, cloud_gateway)
     transport.on_auth_failure = AsyncMock(return_value=False)
 
     fake_client = _FakeMQTTClient(messages=[_bind_reply_msg(2043)])
     with patch("aiomqtt.Client", return_value=fake_client):
-        with pytest.raises(AuthError):
+        with pytest.raises(ReLoginRequiredError):
             await transport._run()
 
     transport.on_auth_failure.assert_awaited_once()
@@ -631,16 +631,16 @@ async def test_bind_reply_2043_callback_returns_false_raises_auth_error(
 
 
 @pytest.mark.asyncio
-async def test_bind_reply_2043_callback_raises_exception_raises_auth_error(
+async def test_bind_reply_2043_callback_raises_nonfatal_exception_raises_relogin_required(
     config: AliyunMQTTConfig, cloud_gateway: MagicMock
 ) -> None:
-    """Exception from on_auth_failure is swallowed; AuthError still propagates."""
+    """Non-ReLoginRequiredError from on_auth_failure is swallowed; ReLoginRequiredError propagates."""
     transport = AliyunMQTTTransport(config, cloud_gateway)
     transport.on_auth_failure = AsyncMock(side_effect=RuntimeError("refresh exploded"))
 
     fake_client = _FakeMQTTClient(messages=[_bind_reply_msg(2043)])
     with patch("aiomqtt.Client", return_value=fake_client):
-        with pytest.raises(AuthError):
+        with pytest.raises(ReLoginRequiredError):
             await transport._run()
 
     transport.on_auth_failure.assert_awaited_once()
@@ -767,41 +767,45 @@ def _make_aliyun_session(iot_token: str = "initial-tok") -> tuple:
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_refresh_succeeds_updates_token_returns_true() -> None:
-    """Happy path: refresh_aliyun_credentials succeeds → token updated on transport → True."""
-    _client, session, transport = _make_aliyun_session("old-tok")
+async def test_on_aliyun_auth_failure_full_relogin_succeeds_updates_token_returns_true() -> None:
+    """Happy path: _full_relogin succeeds → token pushed explicitly → True.
+
+    The callback (on_aliyun_token_refreshed) is the primary propagation path, but an
+    explicit get_aliyun_credentials + update_iot_token call acts as a safety net for
+    cases where force_refresh skips _refresh_aliyun (e.g. cloud_gateway is None).
+    """
+    client, session, transport = _make_aliyun_session("old-tok")
 
     new_creds = MagicMock()
     new_creds.iot_token = "fresh-tok"
-    session.token_manager.refresh_aliyun_credentials = AsyncMock()
+
+    login_resp = MagicMock()
+    login_resp.code = 0
+    session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
+    session.token_manager.force_refresh = AsyncMock()
     session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
 
     result = await transport.on_auth_failure()
 
     assert result is True
     assert transport._iot_token == "fresh-tok"
-    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
+    session.mammotion_http.login_v2.assert_awaited_once()
     session.token_manager.get_aliyun_credentials.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_relogin_required_full_relogin_succeeds() -> None:
-    """refresh_aliyun_credentials raises ReLoginRequiredError → _full_relogin succeeds → True."""
+async def test_on_aliyun_auth_failure_full_relogin_updates_token_and_returns_true() -> None:
+    """_full_relogin succeeds → token explicitly updated → True."""
     client, session, transport = _make_aliyun_session("old-tok")
 
     new_creds = MagicMock()
     new_creds.iot_token = "post-relogin-tok"
 
-    session.token_manager.refresh_aliyun_credentials = AsyncMock(
-        side_effect=ReLoginRequiredError("test@example.com", "session exhausted")
-    )
-    session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
-
-    # _full_relogin calls login_v2 then token_manager.force_refresh
     login_resp = MagicMock()
     login_resp.code = 0
     session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
     session.token_manager.force_refresh = AsyncMock()
+    session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
 
     result = await transport.on_auth_failure()
 
@@ -812,28 +816,53 @@ async def test_on_aliyun_auth_failure_relogin_required_full_relogin_succeeds() -
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_relogin_fails_returns_false() -> None:
-    """refresh_aliyun_credentials raises ReLoginRequiredError → _full_relogin fails → False.
+async def test_on_aliyun_auth_failure_relogin_fails_raises_relogin_required() -> None:
+    """_full_relogin fails → ReLoginRequiredError raised.
 
-    This is the path that tells HA the session is unrecoverable and the user must re-enter
-    credentials.  on_auth_failure returning False causes AuthError to propagate out of _run().
+    The exception propagates through aliyun_mqtt's except-Exception handler,
+    which sets stop_event and raises AuthError — the signal to HA that the user
+    must re-enter credentials.
     """
     client, session, transport = _make_aliyun_session("old-tok")
-
-    session.token_manager.refresh_aliyun_credentials = AsyncMock(
-        side_effect=ReLoginRequiredError("test@example.com", "session exhausted")
-    )
 
     login_resp = MagicMock()
     login_resp.code = 401
     login_resp.msg = "invalid credentials"
     session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
 
-    result = await transport.on_auth_failure()
+    with pytest.raises(ReLoginRequiredError):
+        await transport.on_auth_failure()
 
-    assert result is False
     assert transport._iot_token == "old-tok"  # not updated
     session.mammotion_http.login_v2.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_on_aliyun_auth_failure_never_calls_targeted_refresh() -> None:
+    """on_auth_failure must NOT call refresh_aliyun_credentials.
+
+    The old implementation called refresh_aliyun_credentials first; when the refreshToken
+    was also invalid (code 2401 → SessionExpiredError) this caused ~1300 retries/hour:
+      bind-fail (2043) → targeted refresh → 2401 → bind-fail again → ...
+
+    The fix goes straight to full re-login.  This test guards against that regression.
+    """
+    client, session, transport = _make_aliyun_session("old-tok")
+
+    session.token_manager.refresh_aliyun_credentials = AsyncMock()
+
+    login_resp = MagicMock()
+    login_resp.code = 0
+    session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
+    session.token_manager.force_refresh = AsyncMock()
+    new_creds = MagicMock()
+    new_creds.iot_token = "renewed-tok"
+    session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
+
+    await transport.on_auth_failure()
+
+    # The targeted refresh is never called — only _full_relogin via force_refresh.
+    session.token_manager.refresh_aliyun_credentials.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -859,17 +888,16 @@ async def test_on_aliyun_auth_failure_no_token_manager_returns_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_reply_2043_relogin_failure_raises_auth_error_end_to_end() -> None:
-    """Full cascade: bind_reply 2043 → on_auth_failure → ReLoginRequiredError → _full_relogin
-    fails → callback returns False → AuthError propagates out of _run().
+async def test_bind_reply_2043_relogin_failure_raises_relogin_required_end_to_end() -> None:
+    """Full cascade: bind_reply 2043 → on_auth_failure → _full_relogin fails →
+    ReLoginRequiredError propagates out of _run().
 
-    This is the signal to HA that credentials are unrecoverable and the user must re-login.
+    refresh_aliyun_credentials is never called — that was the source of the 2401 retry loop.
+    on_fatal_auth_error fires (and fails silently), then ReLoginRequiredError re-raises.
     """
     client, session, transport = _make_aliyun_session("stale-tok")
 
-    session.token_manager.refresh_aliyun_credentials = AsyncMock(
-        side_effect=ReLoginRequiredError("test@example.com", "aliyun exhausted")
-    )
+    session.token_manager.refresh_aliyun_credentials = AsyncMock()
     login_resp = MagicMock()
     login_resp.code = 500
     login_resp.msg = "server error"
@@ -878,9 +906,39 @@ async def test_bind_reply_2043_relogin_failure_raises_auth_error_end_to_end() ->
     fake_client = _FakeMQTTClient(messages=[_bind_reply_msg(2043)])
 
     with patch("aiomqtt.Client", return_value=fake_client):
-        with pytest.raises(AuthError):
+        with pytest.raises(ReLoginRequiredError):
             await transport._run()
 
     assert transport._stop_event.is_set()
-    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
-    session.mammotion_http.login_v2.assert_awaited_once()
+    session.token_manager.refresh_aliyun_credentials.assert_not_awaited()
+    # login_v2 called twice: once from on_auth_failure, once from on_fatal_auth_error
+    assert session.mammotion_http.login_v2.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bind_reply_2043_relogin_success_fires_on_fatal_auth_and_reconnects() -> None:
+    """bind_reply 2043 → on_auth_failure fails → on_fatal_auth_error fires → reconnect succeeds."""
+    client, session, transport = _make_aliyun_session("stale-tok")
+
+    fatal_calls: list[ReLoginRequiredError] = []
+
+    async def _on_fatal(exc: ReLoginRequiredError) -> None:
+        fatal_calls.append(exc)
+
+    transport.on_fatal_auth_error = _on_fatal
+
+    # _on_aliyun_auth_failure: full relogin fails → ReLoginRequiredError
+    login_resp_fail = MagicMock()
+    login_resp_fail.code = 500
+    login_resp_fail.msg = "server error"
+    session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp_fail)
+
+    fake_client = _FakeMQTTClient(messages=[_bind_reply_msg(2043)])
+
+    with patch("aiomqtt.Client", return_value=fake_client):
+        with pytest.raises(ReLoginRequiredError):
+            await transport._run()
+
+    assert transport._stop_event.is_set()
+    assert len(fatal_calls) == 1
+    assert isinstance(fatal_calls[0], ReLoginRequiredError)

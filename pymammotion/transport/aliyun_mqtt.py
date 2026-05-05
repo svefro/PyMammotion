@@ -28,7 +28,7 @@ from Tea.exceptions import UnretryableException
 
 from pymammotion.data.mqtt.status import ThingStatusMessage
 from pymammotion.transport.base import (
-    AuthError,
+    ReLoginRequiredError,
     SessionExpiredError,
     Transport,
     TransportAvailability,
@@ -147,6 +147,7 @@ class AliyunMQTTTransport(Transport):
 
     on_message: Callable[[bytes], Awaitable[None]] | None = None
     on_device_message: Callable[[str, bytes], Awaitable[None]] | None = None
+    on_fatal_auth_error: Callable[[ReLoginRequiredError], Awaitable[None]] | None = None
 
     def __init__(self, config: AliyunMQTTConfig, cloud_gateway: CloudIOTGateway) -> None:
         """Initialise the transport with the supplied Aliyun configuration."""
@@ -313,6 +314,20 @@ class AliyunMQTTTransport(Transport):
         self._availability = state
         await self._fire_availability_listeners(state)
 
+    async def _handle_fatal_auth_error(self, exc: ReLoginRequiredError) -> None:
+        """Mark the transport stopped, clean up state, and fire on_fatal_auth_error.
+
+        State must be cleaned up here — before the callback fires — so that any
+        downstream handler sees a consistent DISCONNECTED transport, not one that
+        still appears connected while recovery is being attempted.
+        """
+        self._stop_event.set()
+        self._client = None
+        await self._notify_availability(TransportAvailability.DISCONNECTED)
+        if self.on_fatal_auth_error is not None:
+            with contextlib.suppress(Exception):
+                await self.on_fatal_auth_error(exc)
+
     @staticmethod
     async def get_ssl_context() -> ssl.SSLContext:
         loop = asyncio.get_running_loop()
@@ -400,12 +415,14 @@ class AliyunMQTTTransport(Transport):
                             if await self.on_auth_failure():
                                 _logger.info("Aliyun credentials refreshed after auth failure — retrying")
                                 continue
+                        except ReLoginRequiredError as relogin_exc:
+                            await self._handle_fatal_auth_error(relogin_exc)
+                            raise
                         except Exception:
                             _logger.warning("on_auth_failure callback failed", exc_info=True)
-                    self._stop_event.set()
-                    self._client = None
-                    await self._notify_availability(TransportAvailability.DISCONNECTED)
-                    raise AuthError(str(exc)) from exc
+                    fatal = ReLoginRequiredError("", f"Aliyun MQTT auth exhausted (rc={rc})")
+                    await self._handle_fatal_auth_error(fatal)
+                    raise fatal from exc
                 _logger.warning("Aliyun MQTT error (rc=%s): %s — retry in %ds", rc, exc, backoff)
             except SessionExpiredError as exc:
                 _logger.warning("Aliyun bind token expired — attempting credential refresh: %s", exc)
@@ -414,12 +431,14 @@ class AliyunMQTTTransport(Transport):
                         if await self.on_auth_failure():
                             _logger.info("Aliyun credentials refreshed after bind token expiry — reconnecting")
                             continue
+                    except ReLoginRequiredError as relogin_exc:
+                        await self._handle_fatal_auth_error(relogin_exc)
+                        raise
                     except Exception:
                         _logger.warning("on_auth_failure callback failed", exc_info=True)
-                self._stop_event.set()
-                self._client = None
-                await self._notify_availability(TransportAvailability.DISCONNECTED)
-                raise AuthError(str(exc)) from exc
+                fatal = ReLoginRequiredError("", f"Aliyun bind token unrecoverable: {exc}")
+                await self._handle_fatal_auth_error(fatal)
+                raise fatal from exc
             except aiomqtt.MqttError as exc:
                 _logger.debug("Aliyun MQTT disconnected: %s — retry in %ds", exc, backoff)
             except asyncio.CancelledError:
@@ -430,7 +449,8 @@ class AliyunMQTTTransport(Transport):
                 _logger.warning("Aliyun MQTT network error: %s — retry in %ds", exc, backoff)
             finally:
                 self._client = None
-                await self._notify_availability(TransportAvailability.DISCONNECTED)
+                if self._availability is not TransportAvailability.DISCONNECTED:
+                    await self._notify_availability(TransportAvailability.DISCONNECTED)
 
             if not self._stop_event.is_set():
                 try:

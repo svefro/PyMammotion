@@ -814,9 +814,9 @@ async def test_poll_interval_docked_full_returns_sixty_minutes() -> None:
 async def test_ble_poll_interval_table_values() -> None:
     """ACTIVE → continuous stream (None); other modes → numeric count=1 cadences."""
     assert _BLE_POLL_INTERVAL[_DeviceMode.ACTIVE] is None
-    assert _BLE_POLL_INTERVAL[_DeviceMode.DOCKED_CHARGING] == 5 * 60.0
-    assert _BLE_POLL_INTERVAL[_DeviceMode.DOCKED_FULL] == 30 * 60.0
-    assert _BLE_POLL_INTERVAL[_DeviceMode.IDLE] == 15 * 60.0
+    assert _BLE_POLL_INTERVAL[_DeviceMode.DOCKED_CHARGING] == 60.0
+    assert _BLE_POLL_INTERVAL[_DeviceMode.DOCKED_FULL] == 5 * 60.0
+    assert _BLE_POLL_INTERVAL[_DeviceMode.IDLE] == 5 * 60.0
 
 
 # ---------------------------------------------------------------------------

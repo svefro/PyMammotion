@@ -102,11 +102,17 @@ class MapFetchSaga(Saga):
         if not self._is_luba1:
             _logger.debug("MapFetchSaga[%s]: fetching area names", self._device_name)
             cmd = self._command_builder.get_area_name_list(self._device_id)
-            response = await broker.send_and_wait(
-                send_fn=lambda: self._send_command(cmd),
-                expected_field="toapp_all_hash_name",
-                send_timeout=self.step_timeout,
-            )
+            try:
+                response = await broker.send_and_wait(
+                    send_fn=lambda: self._send_command(cmd),
+                    expected_field="toapp_all_hash_name",
+                    send_timeout=self.step_timeout,
+                )
+            except CommandTimeoutError:
+                cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+                await self._send_command(cmd)
+                raise
+
             _area_frame = self.extract_nav_frame(response, "toapp_all_hash_name")
             area_hash_name_msg = _area_frame[1] if _area_frame is not None else None
             if (
@@ -184,10 +190,14 @@ class MapFetchSaga(Saga):
                     try:
                         response = await asyncio.wait_for(hash_frame_queue.get(), timeout=self.step_timeout)
                     except TimeoutError:
+                        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+                        await self._send_command(cmd)
                         raise CommandTimeoutError("toapp_gethash_ack", 1) from None
 
                     _hash_frame = self.extract_nav_frame(response, "toapp_gethash_ack")
                     if _hash_frame is None:
+                        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+                        await self._send_command(cmd)
                         raise CommandTimeoutError("toapp_gethash_ack", 1)
                     hash_ack = _hash_frame[1]
 
@@ -243,6 +253,8 @@ class MapFetchSaga(Saga):
                 try:
                     response = await asyncio.wait_for(comm_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
+                    cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+                    await self._send_command(cmd)
                     raise CommandTimeoutError("toapp_get_commondata_ack", 1) from None
 
                 # State reducer has already applied this frame to device.map.

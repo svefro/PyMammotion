@@ -378,6 +378,14 @@ class BLETransport(Transport):
             )
         )
 
+        async def _reconnect() -> None:
+            try:
+                await self.connect()
+            except Exception:
+                pass
+
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(_reconnect()))
+
     async def _notification_handler(self, _characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         """Parse incoming BLE notifications through the BluFi codec and forward complete frames."""
         if self._message is None:

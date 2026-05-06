@@ -136,6 +136,24 @@ class TokenManager:
         self._aliyun_creds = aliyun_creds
         self._mqtt_creds = mqtt_creds
 
+    # ------------------------------------------------------------------
+    # Public credential getters — all three follow the same pattern:
+    #
+    #   1. Lock-free fast path: read the cached credentials without taking the
+    #      lock and return immediately if they're still valid.  This keeps the
+    #      common case off the lock entirely so an in-flight refresh on one
+    #      caller does not stall every other caller that already has a usable
+    #      token.
+    #   2. Slow path: acquire the lock, re-check the cache (a concurrent
+    #      refresher may have just succeeded while we yielded), and call the
+    #      relevant refresh helper if still needed.  HTTP timeouts on the
+    #      ClientSession (see ``MammotionHTTP._DEFAULT_HTTP_TIMEOUT``) bound how
+    #      long the refresh — and therefore the lock — can hold.
+    #
+    # The pattern is double-checked locking; idiomatic in async Python because
+    # the lock-acquisition wait IS the contention point we want to skip.
+    # ------------------------------------------------------------------
+
     async def get_valid_http_token(self) -> str:
         """Return a valid HTTP access token, refreshing proactively if it expires within 5 minutes.
 
@@ -146,7 +164,12 @@ class TokenManager:
             ReLoginRequiredError: If the token cannot be refreshed and re-authentication is needed.
 
         """
+        # Fast path: lock-free read for the common "token is still valid" case.
+        creds = self._http_creds
+        if creds is not None and creds.expires_at >= time.time() + 300:
+            return creds.access_token
         async with self._lock:
+            # Re-check under the lock — another coroutine may have refreshed while we waited.
             if self._http_creds is None or self._http_creds.expires_at < time.time() + 300:
                 await self.refresh_http()
             if self._http_creds is None:
@@ -167,6 +190,10 @@ class TokenManager:
         if self._cloud_gateway is None:
             msg = "No Aliyun cloud gateway configured"
             raise RuntimeError(msg)
+        # Fast path: lock-free read for the common "token is still valid" case.
+        creds = self._aliyun_creds
+        if creds is not None and creds.iot_token_expires_at >= time.time() + 3600:
+            return creds
         async with self._lock:
             if self._aliyun_creds is None or self._aliyun_creds.iot_token_expires_at < time.time() + 3600:
                 await self._refresh_aliyun()
@@ -184,6 +211,10 @@ class TokenManager:
             ReLoginRequiredError: If the underlying HTTP token refresh fails.
 
         """
+        # Fast path: lock-free read for the common "token is still valid" case.
+        creds = self._mqtt_creds
+        if creds is not None and creds.expires_at >= time.time() + 1800:
+            return creds
         async with self._lock:
             if self._mqtt_creds is None or self._mqtt_creds.expires_at < time.time() + 1800:
                 await self.refresh_mqtt_creds()

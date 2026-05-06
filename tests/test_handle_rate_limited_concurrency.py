@@ -15,7 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pymammotion.aliyun.exceptions import TooManyRequestsException
-from pymammotion.device.handle import DeviceHandle, _RATE_LIMITED_BACKOFF
+from pymammotion.device.handle import DeviceHandle
+from pymammotion.device.mqtt_loop import _RATE_LIMITED_BACKOFF
 from pymammotion.transport.base import Transport, TransportRateLimitedError, TransportType
 
 

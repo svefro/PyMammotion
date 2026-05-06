@@ -333,8 +333,10 @@ class AliyunMQTTTransport(Transport):
         loop = asyncio.get_running_loop()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
-        # Offload the blocking disk I/O to a separate thread
-        loop.run_in_executor(None, context.load_verify_locations, _CA_CERT_FILE)
+        # Offload the blocking disk I/O to a thread, but await it — otherwise the
+        # context is returned half-loaded and the TLS handshake races the cert
+        # load (any FileNotFoundError on _CA_CERT_FILE would also be lost).
+        await loop.run_in_executor(None, context.load_verify_locations, _CA_CERT_FILE)
         return context
 
     async def _run(self) -> None:

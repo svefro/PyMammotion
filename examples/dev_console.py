@@ -4,15 +4,21 @@ Usage:
     EMAIL=your@email.com PASSWORD=yourpass uv run python examples/dev_console.py
     EMAIL=your@email.com PASSWORD=yourpass uv run python examples/dev_console.py --listen
     uv run python examples/dev_console.py --ble-address AA:BB:CC:DD:EE:FF
+    uv run python examples/dev_console.py --esphome-proxy esp32-proxy.local --ble-address AA:BB:CC:DD:EE:FF
 
 Flags:
-    -l / --listen          Connect and receive messages without sending any outbound polls.
-                           Useful for passive observation or debugging device-initiated traffic.
-    --ble-address MAC      BLE-only mode: connect over Bluetooth to the mower at MAC.
-                           Skips cloud login / MQTT entirely; transport runs its own
-                           BleakScanner.find_device_by_address lookup.
-    --device-name NAME     Friendly device name to register under (BLE-only mode).
-                           Defaults to "Luba-BLE-<MAC suffix>".
+    -l / --listen           Connect and receive messages without sending any outbound polls.
+                            Useful for passive observation or debugging device-initiated traffic.
+    --ble-address MAC       BLE-only mode: connect over Bluetooth to the mower at MAC.
+                            Skips cloud login / MQTT entirely; transport runs its own
+                            BleakScanner.find_device_by_address lookup.
+    --device-name NAME      Friendly device name to register under (BLE-only mode).
+                            Defaults to "Luba-BLE-<MAC suffix>".
+    --esphome-proxy HOST    Route the BLE connection through an ESPHome bluetooth proxy
+                            at HOST (e.g. esp32-bluetooth-proxy.local).  Requires
+                            --ble-address.  Needs the 'extras' deps:
+                                uv sync --group extras
+    --esphome-password PASS Password for the ESPHome proxy (default: empty).
 
 Output files (written to examples/dev_output/):
     state_{device_name}.json        Full device state (mower or RTK), updated on every
@@ -42,7 +48,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Protocol
 
 import IPython
 from rich.console import Console
@@ -53,6 +59,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT
 from pymammotion.client import MammotionClient
 from pymammotion.transport.base import Subscription, TransportType
+
+
+class ExternalMQTT(Protocol):
+    """Protocol for optional external MQTT publishers (see mammotion_to_mqtt.py)."""
+
+    connected: bool
+    dev_console: Any
+
+    async def _publish_device_to_external_mqtt(self, device_name: str) -> None: ...
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Output directory
@@ -132,17 +148,29 @@ def _setup_logging() -> None:
 class DevConsole:
     """Wires per-device callbacks and provides REPL helpers."""
 
-    def __init__(self, mammotion: MammotionClient, main_loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        mammotion: MammotionClient,
+        main_loop: asyncio.AbstractEventLoop,
+        external_mqtt: ExternalMQTT | None = None,
+        *,
+        output_dir: Path | None = None,
+        always_dump: bool = True,
+    ) -> None:
         self.mammotion = mammotion
         self.loop = main_loop
+        self.external_mqtt = external_mqtt
+        self._output_dir = output_dir or OUTPUT_DIR
+        self.always_dump = always_dump
+        if external_mqtt is not None:
+            external_mqtt.dev_console = self
         # Strong references to all callbacks and subscriptions — must outlive the connection
         self._notification_cbs: dict[str, tuple[Callable[..., Awaitable[None]], Subscription]] = {}
 
     # ── File helpers ──────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _state_path(name: str) -> Path:
-        return OUTPUT_DIR / f"state_{name.replace('/', '_')}.json"
+    def _state_path(self, name: str) -> Path:
+        return self._output_dir / f"state_{name.replace('/', '_')}.json"
 
     def dump(self, name: str) -> None:
         """Write the current MowingDevice JSON state for *name* to disk."""
@@ -172,7 +200,10 @@ class DevConsole:
         import betterproto2
 
         async def _on_message(msg: Any) -> None:
-            self.dump(device_name)
+            if self.always_dump:
+                self.dump(device_name)
+            if self.external_mqtt is not None and self.external_mqtt.connected:
+                await self.external_mqtt._publish_device_to_external_mqtt(device_name)
             try:
                 sub_name, _ = betterproto2.which_one_of(msg, "LubaSubMsg")
                 _LOGGER.info(
@@ -315,7 +346,10 @@ class DevConsole:
         from pymammotion.state.device_state import DeviceSnapshot
 
         async def _on_state_changed(snapshot: DeviceSnapshot) -> None:
-            self.dump(device_name)
+            if self.always_dump:
+                self.dump(device_name)
+            if self.external_mqtt is not None and self.external_mqtt.connected:
+                await self.external_mqtt._publish_device_to_external_mqtt(device_name)
             _LOGGER.info(
                 "[bold magenta]← %s[/bold magenta]  [green]state updated[/green]",
                 device_name,
@@ -535,6 +569,46 @@ class DevConsole:
             print(f"  {handle.device_name:<28}  {mqtt_ok:>6}  {size}")
         print()
 
+    async def start_all_devices(self) -> None:
+        """Call handle.start() on every registered device."""
+        for handle in self.mammotion.device_registry.all_devices:
+            _LOGGER.info("Starting [bold]%s[/bold]", handle.device_name)
+            await handle.start()
+
+    async def write_errors_to_file(self) -> None:
+        """Fetch error codes from each cloud account and write them to disk."""
+        for acct_session in self.mammotion.account_registry.all_sessions:
+            if acct_session.cloud_client is None:
+                continue
+            error_codes = await acct_session.cloud_client.mammotion_http.get_all_error_codes()
+            path = self._state_path("out__error_codes")
+            with open(path, "w") as f:
+                json.dump(error_codes, f, indent=2, default=str)
+            _LOGGER.debug("Error codes written → %s", path)
+
+    async def publish_all_devices_to_external_mqtt(self) -> None:
+        """Publish the current state of all devices to the external MQTT broker."""
+        if self.external_mqtt is None or not self.external_mqtt.connected:
+            _LOGGER.warning("External MQTT not connected")
+            return
+        _LOGGER.info("Publishing all devices to external MQTT broker …")
+        for handle in self.mammotion.device_registry.all_devices:
+            await self.external_mqtt._publish_device_to_external_mqtt(handle.device_name)
+        _LOGGER.info("All devices published to external MQTT broker")
+
+    def sync_external_mqtt(self) -> None:
+        """Synchronously publish all devices to external MQTT (REPL helper)."""
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.publish_all_devices_to_external_mqtt(), self.loop
+            )
+            fut.result(timeout=10)
+            print("✓  All devices synced to external MQTT")
+        except TimeoutError:
+            print("✗  Timed out syncing to external MQTT")
+        except Exception as exc:
+            print(f"✗  Error: {exc}")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
@@ -580,6 +654,143 @@ async def _bootstrap_ble_only(
     _LOGGER.info("BLE connected.")
 
 
+async def _bootstrap_ble_via_proxy(
+    mammotion: MammotionClient,
+    proxy_host: str,
+    proxy_password: str,
+    ble_address: str,
+    device_name: str | None,
+    *,
+    discovery_timeout: float = 30.0,
+) -> None:
+    """Connect to the mower via an ESPHome BLE proxy and reuse our BLETransport.
+
+    Bridges aioesphomeapi → bleak-esphome → bleak so the mower's GATT
+    connection is routed through the proxy device, while everything downstream
+    (BLETransport, BleMessage codec, ble_activity_loop, ble_polling_loop)
+    runs unchanged — bleak-esphome installs an ``ESPHomeClient`` shim that
+    bleak_retry_connector.establish_connection picks up automatically.
+
+    Steps:
+      1. Spin up a minimal habluetooth ``BluetoothManager`` (we never call
+         ``_discover_service_info``; the no-op subclass just satisfies the ABC).
+      2. Open an aioesphomeapi connection to the proxy and fetch its DeviceInfo.
+      3. ``connect_scanner`` builds an ESPHomeScanner, sets up the GATT shim,
+         and subscribes to the proxy's BLE advertisement stream.
+      4. Register the scanner with the manager and wait up to
+         *discovery_timeout* seconds for an advertisement matching
+         *ble_address* — that gives us a real ``BLEDevice`` whose backend is
+         the ESPHome proxy.
+      5. Hand the BLEDevice to ``add_ble_only_device(ble_device=..., self_managed_scanning=False)``
+         and call ``transport.connect()`` exactly like the local-bleak path.
+
+    Lazy-imports the optional deps; raises with a clear install hint if missing.
+    """
+    try:
+        from aioesphomeapi import APIClient
+        from bleak_esphome import connect_scanner
+        from bluetooth_adapters import get_adapters
+        from habluetooth import BluetoothManager, set_manager
+    except ImportError as exc:
+        msg = (
+            "ESPHome BLE-proxy mode requires the 'extras' dependency group:\n"
+            "    uv sync --group extras\n"
+            "(or pip install aioesphomeapi bleak-esphome habluetooth bluetooth-adapters)"
+        )
+        raise RuntimeError(msg) from exc
+
+    from pymammotion.data.model.device import MowingDevice
+
+    ble_address = ble_address.upper()
+    if device_name is None:
+        device_name = f"Luba-BLE-{ble_address.replace(':', '')[-6:]}"
+
+    # Step 1: minimal habluetooth manager.  We're not consuming discovery callbacks
+    # (no HA, no integrations subscribing) so _discover_service_info is a no-op.
+    class _NoOpManager(BluetoothManager):  # type: ignore[misc, no-any-unimported]
+        def _discover_service_info(self, service_info: object) -> None:  # noqa: ARG002
+            return
+
+    adapters = get_adapters()
+    manager = _NoOpManager(adapters, slot_manager=None)
+    set_manager(manager)
+    await manager.async_setup()
+
+    # Step 2: open the proxy connection.
+    _LOGGER.info(
+        "[bold yellow]ESPHome proxy mode[/bold yellow] — connecting to proxy at [bold]%s[/bold]",
+        proxy_host,
+    )
+    api = APIClient(address=proxy_host, port=6053, password=proxy_password)
+    await api.connect(login=True)
+    device_info = await api.device_info()
+    _LOGGER.info(
+        "Proxy connected: name=%s mac=%s bt_proxy_features=%s",
+        device_info.name,
+        device_info.bluetooth_mac_address or device_info.mac_address,
+        device_info.bluetooth_proxy_feature_flags_compat(api.api_version),
+    )
+
+    # Step 3: build the scanner.
+    client_data = connect_scanner(api, device_info, available=True)
+    scanner = client_data.scanner
+    if scanner is None:
+        msg = f"connect_scanner returned no scanner for proxy {proxy_host}"
+        raise RuntimeError(msg)
+    await scanner.async_setup()
+
+    # Step 4: register and wait for an advertisement matching our target.
+    unregister = manager.async_register_scanner(scanner)
+    _LOGGER.info(
+        "Scanner registered (connectable=%s) — waiting up to %.0fs for %s …",
+        scanner.connectable,
+        discovery_timeout,
+        ble_address,
+    )
+
+    deadline = asyncio.get_running_loop().time() + discovery_timeout
+    ble_device = None
+    while asyncio.get_running_loop().time() < deadline:
+        # The scanner accumulates devices as the proxy streams advertisements;
+        # poll its discovered set rather than wiring a callback we'd just unwind.
+        for dev, _adv in scanner.discovered_devices_and_advertisement_data.values():
+            if dev.address.upper() == ble_address:
+                ble_device = dev
+                break
+        if ble_device is not None:
+            break
+        await asyncio.sleep(0.5)
+
+    if ble_device is None:
+        unregister()
+        await api.disconnect()
+        msg = (
+            f"BLE device {ble_address} did not appear in advertisements from proxy "
+            f"{proxy_host} within {discovery_timeout:.0f}s"
+        )
+        raise RuntimeError(msg)
+
+    _LOGGER.info("Discovered %s via proxy — registering handle and connecting GATT", ble_address)
+
+    # Step 5: hand the BLEDevice to the existing BLE-only path.  self_managed_scanning=False
+    # because the proxy + scanner own discovery, not bleak directly.
+    handle = await mammotion.add_ble_only_device(
+        device_id=device_name,
+        device_name=device_name,
+        initial_device=MowingDevice(name=device_name),
+        ble_device=ble_device,
+        self_managed_scanning=False,
+    )
+    await handle.start()
+
+    transport = handle.get_transport(TransportType.BLE)
+    if transport is None:
+        msg = f"BLE transport missing on handle for {device_name}"
+        raise RuntimeError(msg)
+    await transport.connect()
+    _LOGGER.info("BLE connected via ESPHome proxy.")
+
+
 async def _main(args: argparse.Namespace) -> None:
     _setup_logging()
 
@@ -587,7 +798,20 @@ async def _main(args: argparse.Namespace) -> None:
     main_loop = asyncio.get_running_loop()
     dev = DevConsole(mammotion, main_loop)
 
-    if args.ble_address:
+    if args.esphome_proxy:
+        if not args.ble_address:
+            msg = "--esphome-proxy requires --ble-address (the mower's BLE MAC)"
+            raise SystemExit(msg)
+        # ESPHome BLE-proxy path: bridge to bleak via bleak-esphome and reuse
+        # the standard BLE-only flow.
+        await _bootstrap_ble_via_proxy(
+            mammotion,
+            proxy_host=args.esphome_proxy,
+            proxy_password=args.esphome_password or "",
+            ble_address=args.ble_address,
+            device_name=args.device_name,
+        )
+    elif args.ble_address:
         # BLE-only path: skip cloud login entirely, connect over Bluetooth.
         await _bootstrap_ble_only(mammotion, args.ble_address, args.device_name)
     else:
@@ -614,9 +838,9 @@ async def _main(args: argparse.Namespace) -> None:
             await handle.stop_polling()
         _LOGGER.info("[bold yellow]Listen-only mode[/bold yellow] — MQTT polling disabled on all devices")
 
-    if not args.ble_address:
+    if not args.ble_address and not args.esphome_proxy:
         # log_mqtt_credentials walks AccountSession.cloud_client / mammotion_http,
-        # both of which are None in BLE-only mode.
+        # both of which are None in any BLE-only mode.
         dev.log_mqtt_credentials()
     dev.dump_all()
 
@@ -693,6 +917,22 @@ if __name__ == "__main__":
         metavar="NAME",
         default=None,
         help="Friendly device name (BLE-only mode).  Defaults to Luba-BLE-<MAC suffix>.",
+    )
+    parser.add_argument(
+        "--esphome-proxy",
+        metavar="HOST",
+        default=None,
+        help=(
+            "Connect via an ESPHome BLE proxy at HOST (e.g. esp32-bluetooth-proxy.local). "
+            "Requires --ble-address.  Skips cloud login.  Needs the 'extras' deps "
+            "(uv sync --group extras)."
+        ),
+    )
+    parser.add_argument(
+        "--esphome-password",
+        metavar="PASS",
+        default=None,
+        help="API password for the ESPHome proxy (default: empty).",
     )
     _args = parser.parse_args()
     try:

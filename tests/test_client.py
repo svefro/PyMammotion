@@ -87,23 +87,18 @@ async def test_stop_calls_device_handle_stop() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_remove_device_schedules_unregister() -> None:
-    """remove_device() must schedule a task that eventually unregisters the handle."""
+async def test_remove_device_unregisters_handle() -> None:
+    """remove_device() must stop and remove the handle from the registry."""
     client = MammotionClient()
 
     handle = make_handle("dev1", "Luba-One")
     handle.stop = AsyncMock()  # type: ignore[method-assign]
     await client._device_registry.register(handle)
 
-    # Verify handle is present before removal
     assert client._device_registry.get_by_name("Luba-One") is handle
 
-    client.remove_device("Luba-One")
+    await client.remove_device("Luba-One")
 
-    # Let the scheduled task run
-    await asyncio.sleep(0)
-
-    # Handle should now be unregistered (stop was called inside unregister)
     handle.stop.assert_awaited_once()
     assert client._device_registry.get_by_name("Luba-One") is None
 
@@ -748,12 +743,12 @@ async def test_send_command_with_args_prefer_ble_uses_ble_after_connect() -> Non
 # handle._poll_interval() — poll interval selection tests
 # ---------------------------------------------------------------------------
 
-from pymammotion.device.handle import (  # noqa: E402
-    _BLE_POLL_INTERVAL,
-    _KEEP_ALIVE_BLE_INTERVAL,
+from pymammotion.device.ble_loop import _BLE_POLL_INTERVAL, _KEEP_ALIVE_BLE_INTERVAL  # noqa: E402
+from pymammotion.device.modes import _DeviceMode  # noqa: E402
+from pymammotion.device.mqtt_loop import (  # noqa: E402
     _MQTT_POLL_INTERVAL,
     _RATE_LIMITED_BACKOFF,
-    _DeviceMode,
+    mqtt_activity_loop,
 )
 
 
@@ -840,7 +835,7 @@ async def test_poll_loop_sends_after_silence() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(return_value=False)),
         patch.object(handle, "_send_one_shot_report", AsyncMock(side_effect=_send_and_stop)),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_awaited_once()
 
@@ -865,7 +860,7 @@ async def test_poll_loop_rate_limited_no_ble_backs_off() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(side_effect=_record_sleep)),
         patch.object(handle, "_send_one_shot_report", one_shot_mock),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_not_awaited()
     assert any(s >= _RATE_LIMITED_BACKOFF for s in sleep_seconds)
@@ -902,7 +897,7 @@ async def test_poll_loop_rate_limited_with_ble_still_polls() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(return_value=False)),
         patch.object(handle, "_send_one_shot_report", AsyncMock(side_effect=_send_and_stop)),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
         await handle.stop()
 
     one_shot_mock.assert_awaited_once()
@@ -929,7 +924,7 @@ async def test_poll_loop_defers_while_ble_stream_active() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(side_effect=_record_and_stop)),
         patch.object(handle, "_send_one_shot_report", one_shot_mock),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_not_awaited()
     assert sleep_calls, "MQTT loop should have entered _sleep_or_rearm"
@@ -957,7 +952,7 @@ async def test_poll_loop_skips_during_saga() -> None:
         patch.object(handle, "_send_one_shot_report", one_shot_mock),
         patch.object(type(handle.queue), "is_saga_active", new_callable=lambda: property(lambda _: True)),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_not_awaited()
     assert sleep_count >= 1
@@ -1284,7 +1279,7 @@ async def test_poll_loop_never_polls_when_device_reported_offline_and_no_ble() -
         patch.object(handle, "_sleep_or_rearm", AsyncMock(side_effect=_counting_sleep)),
         patch.object(handle, "_send_one_shot_report", one_shot_mock),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     # The loop must have looped — we forced 5 sleeps — and never sent a poll.
     assert sleep_count >= iteration_cap
@@ -1333,7 +1328,7 @@ async def test_poll_loop_resumes_after_mqtt_offline_clears() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(side_effect=_sleep_then_recover)),
         patch.object(handle, "_send_one_shot_report", AsyncMock(side_effect=_send_and_stop)),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_awaited_once()
 
@@ -1363,7 +1358,7 @@ async def test_poll_loop_skips_when_ble_only_in_cooldown_and_no_mqtt() -> None:
         patch.object(handle, "_sleep_or_rearm", AsyncMock(side_effect=_counting_sleep)),
         patch.object(handle, "_send_one_shot_report", one_shot_mock),
     ):
-        await asyncio.wait_for(handle._mqtt_activity_loop(), timeout=2.0)
+        await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
     one_shot_mock.assert_not_awaited()
 

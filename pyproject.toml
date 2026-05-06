@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymammotion"
-version = "0.7.97"
+version = "0.7.98"
 description = ""
 authors = [
     { name = "Michael Arthur", email = "michael@jumblesoft.co.nz" },
@@ -41,6 +41,8 @@ dependencies = [
 extras = [
     "pyjoystick>=1.2.4,<2",
     "nest-asyncio>=1.6.0,<2",
+    "aioesphomeapi>=44.23.0",
+    "bleak-esphome>=3.7.3",
 ]
 dev = [
     "types-protobuf>=6.32.1.20250918,<7",
@@ -75,7 +77,7 @@ include = ["pymammotion"]
 include = ["pymammotion"]
 
 [tool.bumpver]
-current_version = "0.7.97"
+current_version = "0.7.98"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message  = "Bump version {old_version} -> {new_version}"
 commit          = true

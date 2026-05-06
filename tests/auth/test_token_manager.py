@@ -137,6 +137,93 @@ async def test_mqtt_creds_not_refreshed_when_fresh() -> None:
     tm.refresh_mqtt_creds.assert_not_awaited()  # type: ignore[attr-defined]
 
 
+async def test_get_valid_http_token_does_not_block_on_in_flight_refresh() -> None:
+    """Fast path: if creds are still valid, the getter must not wait on the lock.
+
+    Regression: TokenManager._lock used to be acquired unconditionally, so a
+    slow in-flight refresh of one credential type stalled every other caller
+    that already had a usable token.
+    """
+    http = AsyncMock()
+    tm = TokenManager("acc1", http)
+    await tm.initialize(make_http_creds(3600), None, None)  # valid for 1 hour
+
+    # Hold the lock from another coroutine for a long time.
+    lock_held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with tm._lock:  # noqa: SLF001
+            lock_held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    await lock_held.wait()
+
+    # Fast path must complete without acquiring the lock.
+    token = await asyncio.wait_for(tm.get_valid_http_token(), timeout=0.5)
+    assert token == "tok"
+
+    release.set()
+    await holder
+
+
+async def test_get_aliyun_credentials_does_not_block_on_in_flight_refresh() -> None:
+    """Fast path: aliyun getter must not wait on the lock when creds are valid."""
+    http = AsyncMock()
+    gateway = MagicMock()
+    tm = TokenManager("acc1", http, cloud_gateway=gateway)
+    creds = AliyunCredentials(
+        iot_token="iot",
+        iot_token_expires_at=time.time() + 7200,  # 2 hours — well above 1-hour threshold
+        refresh_token="ref",
+        refresh_token_expires_at=time.time() + 86400,
+    )
+    await tm.initialize(make_http_creds(3600), creds, None)
+
+    lock_held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with tm._lock:  # noqa: SLF001
+            lock_held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    await lock_held.wait()
+
+    result = await asyncio.wait_for(tm.get_aliyun_credentials(), timeout=0.5)
+    assert result is creds
+
+    release.set()
+    await holder
+
+
+async def test_get_mqtt_credentials_does_not_block_on_in_flight_refresh() -> None:
+    """Fast path: mqtt getter must not wait on the lock when creds are valid."""
+    http = AsyncMock()
+    tm = TokenManager("acc1", http)
+    mqtt = make_mqtt_creds(7200)  # 2 hours — above 30-min threshold
+    await tm.initialize(make_http_creds(3600), None, mqtt)
+
+    lock_held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with tm._lock:  # noqa: SLF001
+            lock_held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    await lock_held.wait()
+
+    result = await asyncio.wait_for(tm.get_mammotion_mqtt_credentials(), timeout=0.5)
+    assert result is mqtt
+
+    release.set()
+    await holder
+
+
 async def test_initialize_stores_credentials() -> None:
     """initialize() must store all three credential types."""
     http = AsyncMock()

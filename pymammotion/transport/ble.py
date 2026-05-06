@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import logging
 import time
@@ -90,6 +91,12 @@ class BLETransport(Transport):
         # thread inside bleak's backend) can schedule async work safely.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._operation_lock: asyncio.Lock = asyncio.Lock()
+        #: Serializes ``connect()`` calls so two concurrent writers (or a writer
+        #: and an auto-reconnect from the disconnect callback) cannot both call
+        #: ``establish_connection`` in parallel.  Distinct from ``_operation_lock``
+        #: so a write that triggers reconnect doesn't deadlock when ``connect()``
+        #: runs from inside the operation lock.
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
         #: Consecutive ``BleakError`` failures from ``establish_connection``.  Reset on
         #: successful connect or explicit ``clear_ble_device()``.  At
         #: ``config.connect_failure_threshold`` the transport self-clears and starts a cooldown.
@@ -194,61 +201,81 @@ class BLETransport(Transport):
                 disabled (or address is missing for the scan).
 
         """
-        # Cooldown gate first — refuse immediately so the caller falls back to MQTT
-        # rather than burning a connection slot on a doomed attempt.
+        # Fast cooldown gate — refuse immediately without taking the lock so the
+        # caller falls back to MQTT rather than burning a connection slot.
         remaining = self._connect_cooldown_until - time.monotonic()
         if remaining > 0:
             raise BLEUnavailableError(
                 f"BLE connect for {self._config.device_id!r} is in cooldown ({remaining:.0f}s remaining)"
             )
 
-        if self._ble_device is None:
-            if self._config.self_managed_scanning:
-                await self._self_managed_discover()
-            if self._ble_device is None:
-                msg = (
-                    f"No BLEDevice registered for device_id={self._config.device_id!r}; "
-                    f"call set_ble_device() first or enable self_managed_scanning in the config"
+        # Serialize concurrent connects.  Two writers racing through
+        # ``_write_payload`` (or a write racing the disconnect-callback's
+        # auto-reconnect) must not both call ``establish_connection`` —
+        # bleak/the proxy don't tolerate parallel connects against the same client.
+        async with self._connect_lock:
+            # Re-check cooldown under the lock — another caller may have tripped
+            # the threshold while we were waiting.
+            remaining = self._connect_cooldown_until - time.monotonic()
+            if remaining > 0:
+                raise BLEUnavailableError(
+                    f"BLE connect for {self._config.device_id!r} is in cooldown ({remaining:.0f}s remaining)"
                 )
-                raise NoBLEAddressKnownError(msg)
 
-        if self.is_connected:
-            _logger.debug("BLETransport.connect() called while already connected — ignoring")
-            return
+            if self._ble_device is None:
+                if self._config.self_managed_scanning:
+                    await self._self_managed_discover()
+                if self._ble_device is None:
+                    msg = (
+                        f"No BLEDevice registered for device_id={self._config.device_id!r}; "
+                        f"call set_ble_device() first or enable self_managed_scanning in the config"
+                    )
+                    raise NoBLEAddressKnownError(msg)
 
-        # Capture the loop NOW so _handle_disconnect can dispatch back into it
-        # even if bleak invokes the callback from a different thread.
-        self._loop = asyncio.get_running_loop()
+            # Re-check connection state under the lock — a previous holder may
+            # have just established the connection on our behalf.
+            if self.is_connected:
+                _logger.debug("BLETransport.connect() called while already connected — ignoring")
+                return
 
-        await self._notify_availability(TransportAvailability.CONNECTING)
-        _logger.debug("BLETransport connecting to %s", self._config.device_id)
+            # Capture the loop NOW so _handle_disconnect can dispatch back into it
+            # even if bleak invokes the callback from a different thread.
+            self._loop = asyncio.get_running_loop()
 
-        try:
-            self._client = await establish_connection(
-                BleakClientWithServiceCache,
-                self._ble_device,
-                self._config.device_id,
-                self._handle_disconnect,
-                max_attempts=2,
-                ble_device_callback=lambda: self._ble_device,  # type: ignore[arg-type,return-value]
-            )
-        except BleakError as exc:
-            await self._notify_availability(TransportAvailability.DISCONNECTED)
-            self._record_connect_failure()
-            raise BLEUnavailableError(f"BLE connection failed for {self._config.device_id!r}: {exc}") from exc
+            await self._notify_availability(TransportAvailability.CONNECTING)
+            _logger.debug("BLETransport connecting to %s", self._config.device_id)
 
-        self._message = BleMessage(self._client)
+            try:
+                self._client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    self._ble_device,
+                    self._config.device_id,
+                    self._handle_disconnect,
+                    max_attempts=2,
+                    ble_device_callback=lambda: self._ble_device,  # type: ignore[arg-type,return-value]
+                )
+            except BleakError as exc:
+                await self._notify_availability(TransportAvailability.DISCONNECTED)
+                self._record_connect_failure()
+                raise BLEUnavailableError(f"BLE connection failed for {self._config.device_id!r}: {exc}") from exc
 
-        await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
-        await self._notify_availability(TransportAvailability.CONNECTED)
-        _logger.debug("BLETransport connected to %s", self._config.device_id)
+            self._message = BleMessage(self._client)
 
-        # Successful connect resets the failure tracker.
-        self._consecutive_failures = 0
+            # BlueZ may retain a stale notify subscription from a previous ungraceful
+            # disconnect.  Release it proactively so start_notify doesn't get
+            # [org.bluez.Error.NotPermitted] Notify acquired.
+            with contextlib.suppress(Exception):
+                await self._client.stop_notify(UUID_NOTIFICATION_CHARACTERISTIC)
+            await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
+            await self._notify_availability(TransportAvailability.CONNECTED)
+            _logger.debug("BLETransport connected to %s", self._config.device_id)
 
-        # One-shot sync on connect — subsequent periodic syncs are driven by
-        # DeviceHandle._keep_alive_loop (20 s).
-        await self._ble_sync()
+            # Successful connect resets the failure tracker.
+            self._consecutive_failures = 0
+
+            # One-shot sync on connect — subsequent periodic syncs are driven by
+            # DeviceHandle._keep_alive_loop (20 s).
+            await self._ble_sync()
 
     def _record_connect_failure(self) -> None:
         """Increment the failure counter; at threshold, clear device and start cooldown.
@@ -319,22 +346,33 @@ class BLETransport(Transport):
         await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def _write_payload(self, payload: bytes) -> None:
-        """Write *payload* over GATT. Raises TransportError on failure."""
-        if self._client is None or self._message is None:
-            msg = "BLETransport has no client; cannot send payload"
-            raise TransportError(msg)
+        """Write *payload* over GATT. Raises TransportError on failure.
+
+        The auto-reconnect, the connection re-check, and the GATT write all
+        happen under ``_operation_lock``.  This serializes concurrent writers so
+        two callers can't both observe ``not is_connected`` and race
+        ``establish_connection``; it also prevents a write from running against
+        ``_message``/``_client`` that the disconnect handler is in the middle
+        of clearing.  ``connect()`` uses a separate ``_connect_lock`` so this
+        nested call doesn't self-deadlock.
+        """
         _logger.debug("BLETransport send: %d bytes to %s", len(payload), self._config.device_id)
-        if not self._client.is_connected:
-            await self.connect()
-        try:
-            async with self._operation_lock:
+        async with self._operation_lock:
+            if self._client is None or not self._client.is_connected:
+                await self.connect()
+            if self._client is None or self._message is None:
+                msg = f"BLETransport has no client; cannot send payload to {self._config.device_id!r}"
+                raise TransportError(msg)
+            try:
                 await self._message.post_custom_data_bytes(payload)
-        except (TimeoutError, BleakError, OSError) as exc:
-            await self._notify_availability(TransportAvailability.DISCONNECTED)
-            raise TransportError(f"BLE send failed for {self._config.device_id!r}: {exc}") from exc
-        if not self._client.is_connected:
-            await self._notify_availability(TransportAvailability.DISCONNECTED)
-            raise TransportError(f"BLE send failed for {self._config.device_id!r}: client disconnected during write")
+            except (TimeoutError, BleakError, OSError) as exc:
+                await self._notify_availability(TransportAvailability.DISCONNECTED)
+                raise TransportError(f"BLE send failed for {self._config.device_id!r}: {exc}") from exc
+            if not self._client.is_connected:
+                await self._notify_availability(TransportAvailability.DISCONNECTED)
+                raise TransportError(
+                    f"BLE send failed for {self._config.device_id!r}: client disconnected during write"
+                )
 
     async def send(self, payload: bytes, iot_id: str = "") -> None:
         """Frame and write payload via the BleMessage codec."""
@@ -354,37 +392,45 @@ class BLETransport(Transport):
         """Handle unexpected disconnect reported by bleak.
 
         bleak may invoke this callback from a non-asyncio thread depending on the
-        backend, so we cannot use asyncio.get_running_loop() here. Use the loop
-        captured at connect() time and dispatch via call_soon_threadsafe().
-        """
-        if self._availability is TransportAvailability.DISCONNECTED:
-            return
+        backend.  We do **not** mutate any state here — every reader of
+        ``_message``/``_client``/``_availability`` lives on the event loop, so
+        cross-thread mutation could race a concurrent ``_write_payload`` that has
+        already passed its is-connected check.  Instead, schedule
+        ``_on_disconnect_async`` onto the captured loop and let it do all the work.
 
-        _logger.warning("BLETransport: device %s disconnected", self._config.device_id)
-        self._message = None
-        self._availability = TransportAvailability.DISCONNECTED
-        if not self._availability_listeners:
-            return
+        Without a captured loop we can't dispatch — fall back to a synchronous
+        flag flip so the next event-loop-side caller sees DISCONNECTED.  This is
+        only safe before ``connect()`` has ever run (no listeners, no live writes).
+        """
         loop = self._loop
         if loop is None or loop.is_closed():
-            _logger.debug(
-                "BLETransport[%s]: no captured loop, dropping disconnect notification",
-                self._config.device_id,
-            )
+            self._availability = TransportAvailability.DISCONNECTED
             return
-        loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(  # - fire-and-forget dispatch
-                self._fire_availability_listeners(TransportAvailability.DISCONNECTED)
-            )
-        )
+        loop.call_soon_threadsafe(self._dispatch_disconnect)
 
-        async def _reconnect() -> None:
-            try:
-                await self.connect()
-            except Exception:
-                pass
+    def _dispatch_disconnect(self) -> None:
+        """Schedule async disconnect handling.  Runs on the event loop."""
+        asyncio.create_task(self._on_disconnect_async())
 
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(_reconnect()))
+    async def _on_disconnect_async(self) -> None:
+        """Process an unexpected disconnect on the event loop.
+
+        Single-threaded once we're here: every other writer to ``_message``,
+        ``_client``, and ``_availability`` is also on this loop, so no extra
+        synchronization is required.
+
+        Auto-reconnect is *not* attempted here — the higher-level loops in
+        ``DeviceHandle`` decide when to revive BLE (on user command, on the
+        BLE polling tick, on advertisement-driven cooldown expiry).  Doing it
+        from the disconnect callback caused unconditional reconnect storms,
+        including racing the explicit ``disconnect()`` path.
+        """
+        self._client = None
+        self._message = None
+        if self._availability is TransportAvailability.DISCONNECTED:
+            return
+        _logger.warning("BLETransport: device %s disconnected", self._config.device_id)
+        await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def _notification_handler(self, _characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         """Parse incoming BLE notifications through the BluFi codec and forward complete frames."""

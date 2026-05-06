@@ -13,7 +13,7 @@ import random
 import time
 from typing import Any, TypeVar, cast
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 import jwt
 
 from pymammotion.const import (
@@ -157,13 +157,20 @@ class MammotionHTTP:
         # Replace the line in the __init__ method with:
         self.client_id = f"{int(time.time() * 1000)}_{get_10_random()}_1"
 
+    #: Default total timeout for internally-created ClientSessions.  Bounds how
+    #: long any HTTP round-trip (login, refresh, MQTT credentials, …) can take,
+    #: which in turn bounds how long ``TokenManager._lock`` is held by an
+    #: in-flight refresh.  Without this, aiohttp's 5-min default would let a
+    #: slow Mammotion server stall every other coroutine waiting on a token.
+    _DEFAULT_HTTP_TIMEOUT: ClientTimeout = ClientTimeout(total=30)
+
     @asynccontextmanager
     async def _client_session(self) -> AsyncIterator[ClientSession]:
         """Yield the externally-provided session, or a fresh one that is closed after use."""
         if self._session is not None:
             yield self._session
         else:
-            async with ClientSession() as session:
+            async with ClientSession(timeout=self._DEFAULT_HTTP_TIMEOUT) as session:
                 yield session
 
     @property

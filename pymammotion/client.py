@@ -160,12 +160,10 @@ class MammotionClient:
         for handle in self._device_registry.all_devices:
             await handle.stop()
 
-    def remove_device(self, name: str) -> None:
-        """Schedule removal of the named device (fire-and-forget async task)."""
-        loop = asyncio.get_event_loop()
+    async def remove_device(self, name: str) -> None:
+        """Stop and remove the named device from the registry."""
         if handle := self._device_registry.get_by_name(name):
-            task = loop.create_task(self._device_registry.unregister(handle.device_id))
-            del task  # RUF006: reference held briefly to satisfy linter, task is fire-and-forget
+            await self._device_registry.unregister(handle.device_id)
 
     # ------------------------------------------------------------------
     # Device state watchers
@@ -772,6 +770,21 @@ class MammotionClient:
         """
         if ble_device is None and ble_address is None:
             raise ValueError("add_ble_only_device requires either ble_device or ble_address")
+
+        # Idempotency: if this device is already registered (e.g. a config-entry reload
+        # races with the previous teardown), reuse the existing handle rather than
+        # replacing it and orphaning the live BLE connection.
+        existing = self._device_registry.get(device_id)
+        if existing is not None:
+            _logger.info("add_ble_only_device: %s already registered — reusing handle", device_name)
+            if ble_device is not None:
+                ble_t = existing.get_transport(TransportType.BLE)
+                if ble_t is not None:
+                    cast(BLETransport, ble_t).set_ble_device(ble_device)
+                else:
+                    await self.add_ble_to_device(device_name, ble_device)
+            return existing
+
         if self_managed_scanning is None:
             self_managed_scanning = ble_device is None
 

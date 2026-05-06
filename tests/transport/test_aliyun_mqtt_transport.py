@@ -480,10 +480,12 @@ async def test_oserror_retries_without_auth_failure(config: AliyunMQTTConfig, cl
          patch("pymammotion.transport.aliyun_mqtt._MQTT_RECONNECT_MAX_SEC", 0), \
          patch("aiomqtt.Client", side_effect=_client_factory):
         await transport.connect()
-        for _ in range(100):
+        # Use a small real sleep — `asyncio.sleep(0)` does not pump executor
+        # callbacks, and `get_ssl_context` now properly awaits a thread offload.
+        for _ in range(200):
             if connect_attempts >= 3:
                 break
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.005)
         await transport.disconnect()
 
     assert connect_attempts >= 3
@@ -511,10 +513,10 @@ async def test_dns_error_retries_without_auth_failure(config: AliyunMQTTConfig, 
          patch("pymammotion.transport.aliyun_mqtt._MQTT_RECONNECT_MAX_SEC", 0), \
          patch("aiomqtt.Client", side_effect=_client_factory):
         await transport.connect()
-        for _ in range(100):
+        for _ in range(200):
             if connect_attempts >= 2:
                 break
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.005)
         await transport.disconnect()
 
     assert connect_attempts >= 2

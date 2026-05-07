@@ -1,0 +1,838 @@
+"""Interactive development console for PyMammotion that publishes data to external MQTT server
+
+Description:
+    Connects to mammotion servers to act as a gateway between mammotion mqtt and a local mqtt server
+    publishes all parameters to local mqtt server on change.
+
+    based on PyMammotion/examples/dev_console.py
+
+
+
+    accepts commands on:
+        {base_topic}/devices/{device_id}/send
+        {base_topic}/devices/{device_id}/send_and_wait
+        {base_topic}/devices/{device_id}/sync_map
+        {base_topic}/devices/{device_id}/fetch_rtk
+        {base_topic}/devices/{device_id}/publish_all
+    Payload is json.
+
+    Sample:
+        {
+            cmd:"single_schedule",
+            expected_field:"todev_planjob_set",
+            kwargs: {
+                plan_id: plan_id_number_here
+            }
+        }
+
+    Should handle requesting updates from mammotion automaticaly.
+    if you need a update you can send these commands:
+
+        Sample commands here ? or create special topics to do this per device???
+        like:
+            {base_topic}/devices/{device_id}/update_map
+            {base_topic}/devices/{device_id}/update_basic
+            {base_topic}/devices/{device_id}/update_location
+
+
+Usage:
+    create .env file in same folder as this file:
+    adjust content:
+        EXTERNAL_MQTT_HOST=mqtt_host_here
+        EXTERNAL_MQTT_PORT=1883
+        EXTERNAL_MQTT_USER=username_here
+        EXTERNAL_MQTT_PASS=password_here
+        EXTERNAL_MQTT_TOPIC=m2m
+        EMAIL=your@email.com
+        PASSWORD=password_here
+Flags:
+    -l / --listen          Connect and receive messages without sending any outbound polls.
+                           Useful for passive observation or debugging device-initiated traffic.
+    --ble-address MAC      BLE-only mode: connect over Bluetooth to the mower at MAC.
+                           Skips cloud login / MQTT entirely; transport runs its own
+                           BleakScanner.find_device_by_address lookup.
+    --device-name NAME     Friendly device name to register under (BLE-only mode).
+                           Defaults to "Luba-BLE-<MAC suffix>".
+Aditional Requirements:
+    pip install ipython
+    pip install rich
+    pip install aiomqtt
+    pip install pyjwt # not jwt
+    pip install shapely
+    pip install python-dotenv
+
+Output files (written to examples/mammotion2mqtt_output/):
+    state_{device_name}.json        Full device state (mower or RTK), updated on every
+                                    incoming state change.
+    mammotion_dev.log               Full DEBUG log.
+
+Available in the IPython REPL:
+    mammotion                       MammotionClient singleton (cloud connection active)
+    devices                         list[DeviceHandle]
+    send(name, cmd, **kwargs)       Queue a command and block until complete
+    send_and_wait(name, cmd, field) Send and block until the response arrives
+    fetch_rtk(name)                 Fetch LoRa version for an RTK base station
+    dump(name)                      Force-write state_{name}.json right now
+    listen(on=True)                 Stop/resume MQTT polling on all devices
+    console                         DevConsole instance
+    loop                            The main asyncio event loop
+    publish_all(name)               Publish all states to MQTT for a device. even if the value has not changed
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from datetime import UTC, datetime
+import json
+import logging
+import os
+from pathlib import Path
+import sys
+from typing import Any
+
+import aiomqtt
+import IPython  # noqa: F401 — re-exported for REPL namespace
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
+
+from dev_console import DevConsole, _bootstrap_ble_only, _load_credentials, _rich_console, _save_credentials
+from dotenv import load_dotenv
+
+from pymammotion.client import MammotionClient
+from pymammotion.transport.base import TransportType
+
+_LOGGER = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config — populated by _load_env_config() at startup
+# ──────────────────────────────────────────────────────────────────────────────
+
+always_update_dump_files = False
+write_log_to_file = False
+publish_full_state = False
+mammotion_client_ha_version = "0.5.27"
+
+
+def _load_env_config() -> None:
+    """Load .env file and apply environment-driven config flags (call once at startup)."""
+    global always_update_dump_files, write_log_to_file, publish_full_state, mammotion_client_ha_version
+
+    load_dotenv()
+
+    def _lower(var: str) -> str:
+        return os.getenv(var, "").lower()
+
+    for var in [
+        "EXTERNAL_MQTT_HOST", "EXTERNAL_MQTT_PORT", "EXTERNAL_MQTT_USER", "EXTERNAL_MQTT_PASS",
+        "EXTERNAL_MQTT_TOPIC", "EMAIL", "PASSWORD",
+    ]:
+        if os.getenv(var):
+            if "pass" in var.lower():
+                print(f"Environment variable {var} is set to 'XXXXXXX' (Password)")
+            else:
+                print(f"Environment variable {var} is set to '{os.getenv(var)}'")
+        else:
+            print(f"Environment variable {var} is not set")
+
+    if _lower("MAMMOTION2MQTT_WRITE_FILES") == "true":
+        print("always_update_dump_files")
+        always_update_dump_files = True
+        print("write_log_to_file")
+        write_log_to_file = True
+    if _lower("MAMMOTION2MQTT_PUBLISH_STATE") == "true":
+        print("publish_full_state")
+        publish_full_state = True
+    if _lower("MAMMOTION2MQTT_HA_VERSION"):
+        mammotion_client_ha_version = _lower("MAMMOTION2MQTT_HA_VERSION")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output directory
+# ──────────────────────────────────────────────────────────────────────────────
+
+OUTPUT_DIR = Path(__file__).parent / "mammotion2mqtt_output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def _setup_logging() -> None:
+    from rich.logging import RichHandler
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    rich = RichHandler(
+        console=_rich_console,
+        rich_tracebacks=True,
+        show_time=True,
+        show_path=False,
+        markup=True,
+    )
+    rich.setLevel(logging.INFO)
+    root.addHandler(rich)
+
+    if write_log_to_file:
+        fh = logging.FileHandler(OUTPUT_DIR / "mammotion_dev.log", mode="a", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s  %(message)s"))
+        root.addHandler(fh)
+
+    for module in (
+        "pymammotion.transport",
+        "pymammotion.client",
+        "pymammotion.device",
+        "pymammotion.messaging",
+        "pymammotion.aliyun",
+        "pymammotion.http",
+    ):
+        logging.getLogger(module).setLevel(logging.DEBUG)
+    for noisy in ("aiomqtt", "aiohttp", "asyncio", "bleak"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# External MQTT Publisher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class ExternalMQTTPublisher:
+    """Publishes device state to an external MQTT broker and subscribes to commands."""
+
+    def __init__(
+            self,
+            host: str,
+            port: int = 1883,
+            username: str | None = None,
+            password: str | None = None,
+            base_topic: str = "mammotion",
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.base_topic = base_topic
+        self.client: aiomqtt.Client | None = None
+        self.connected = False
+        self._context_manager = None
+        self.dev_console: DevConsole | None = None
+        self._listener_task: asyncio.Task | None = None
+        self._previous_state: dict[str, dict[str, Any]] = {}
+
+    async def connect(self) -> None:
+        """Connect to the external MQTT broker."""
+        self._will = aiomqtt.Will(
+            topic=f"{self.base_topic}/mammotion2mqtt/status", payload="offline", retain=True
+        )
+        try:
+            self.client = aiomqtt.Client(
+                hostname=self.host,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                will=self._will,
+            )
+            self._context_manager = self.client.__aenter__()
+            await self._context_manager
+            self.connected = True
+            await self.client.publish(
+                f"{self.base_topic}/mammotion2mqtt/status", payload="online", retain=True
+            )
+            await self.client.publish(
+                f"{self.base_topic}/mammotion2mqtt/account_email",
+                payload=os.getenv("EMAIL", "").lower(),
+                retain=True,
+            )
+            _LOGGER.info(
+                "Connected to external MQTT broker [bold]%s:%d[/bold]",
+                self.host,
+                self.port,
+            )
+            try:
+                self._listener_task = asyncio.create_task(self._listen_for_commands())
+                _LOGGER.info("Command listener task created")
+            except Exception as e:
+                _LOGGER.error("Failed to create command listener task: %s", e, exc_info=True)
+        except Exception as e:
+            _LOGGER.error("Failed to connect to external MQTT broker: %s", e, exc_info=True)
+            self.connected = False
+            self.client = None
+
+    async def disconnect(self) -> None:
+        """Disconnect from the external MQTT broker."""
+        if self._listener_task is not None:
+            self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.client is not None:
+            try:
+                await self.client.__aexit__(None, None, None)
+                self.connected = False
+                _LOGGER.info("Disconnected from external MQTT broker")
+            except Exception as e:
+                _LOGGER.error("Error disconnecting from MQTT: %s", e)
+            finally:
+                self.client = None
+
+    async def publish(self, topic: str, payload: str | dict, retain: bool = False, qos: int = 2) -> None:
+        """Publish a message to the external MQTT broker."""
+        if not self.connected or self.client is None:
+            _LOGGER.warning("MQTT not connected, skipping publish to %s", topic)
+            return
+
+        if isinstance(payload, dict):
+            payload = json.dumps(payload)
+
+        try:
+            await self.client.publish(topic, payload, qos, retain=retain)
+        except Exception as e:
+            _LOGGER.warning("Failed to publish to %s: %s", topic, e)
+
+    async def _listen_for_commands(self) -> None:
+        """Subscribe to command topics and process incoming commands."""
+        if not self.client:
+            _LOGGER.error("MQTT client not initialized")
+            return
+
+        try:
+            await self.client.subscribe(f"{self.base_topic}/devices/+/send")
+            await self.client.subscribe(f"{self.base_topic}/devices/+/send_and_wait")
+            await self.client.subscribe(f"{self.base_topic}/devices/+/sync_map")
+            await self.client.subscribe(f"{self.base_topic}/devices/+/fetch_rtk")
+            await self.client.subscribe(f"{self.base_topic}/devices/+/publish_all")
+
+            _LOGGER.info("Subscribed to command topics under [bold]%s/devices/+[/bold]", self.base_topic)
+
+            async for message in self.client.messages:
+                try:
+                    await self._handle_command(message)
+                except Exception as e:
+                    _LOGGER.error("Error handling command message: %s", e, exc_info=True)
+
+        except asyncio.CancelledError:
+            _LOGGER.info("Command listener cancelled")
+        except Exception as e:
+            _LOGGER.error("Error in command listener: %s", e, exc_info=True)
+
+    async def _handle_command(self, message: Any) -> None:
+        """Handle an incoming MQTT command message."""
+        try:
+            topic = str(message.topic)
+            payload = message.payload.decode() if isinstance(message.payload, bytes) else message.payload
+
+            parts = topic.split("/")
+            if len(parts) < 4:
+                _LOGGER.warning("Invalid command topic format: %s", topic)
+                return
+
+            device_name = parts[2]
+            command = parts[3]
+
+            cmd_data: dict[str, Any] = {}
+            if payload:
+                try:
+                    cmd_data = json.loads(payload)
+                except json.JSONDecodeError:
+                    _LOGGER.warning("Invalid JSON in command payload: %s", payload)
+                    return
+
+            _LOGGER.info(
+                "[bold yellow]→ MQTT Command[/bold yellow]  [cyan]%s[/cyan]  [green]%s[/green]",
+                device_name,
+                command,
+            )
+
+            if not self.dev_console:
+                _LOGGER.error("DevConsole not set up for command execution")
+                return
+
+            if command == "send":
+                await self._execute_send(device_name, cmd_data)
+            elif command == "send_and_wait":
+                await self._execute_send_and_wait(device_name, cmd_data)
+            elif command == "sync_map":
+                await self._execute_sync_map(device_name, cmd_data)
+            elif command == "fetch_rtk":
+                await self._execute_fetch_rtk(device_name, cmd_data)
+            elif command == "publish_all":
+                await self._execute_publish_all(device_name, cmd_data)
+            else:
+                _LOGGER.warning("Unknown command: %s", command)
+
+        except Exception as e:
+            _LOGGER.error("Error handling command: %s", e, exc_info=True)
+
+    def _flatten_dict(self, d: dict, parent_key: str = "", sep: str = "/") -> dict[str, Any]:
+        """Flatten a nested dictionary for MQTT topic publishing."""
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+
+            if isinstance(v, (list, tuple)):
+                items.append((new_key, json.dumps(v)))
+            elif isinstance(v, dict):
+                items.extend(self._flatten_dict(v, new_key, sep=sep).items())
+            elif isinstance(v, (str, int, float, bool, type(None))):
+                items.append((new_key, v))
+            else:
+                try:
+                    items.append((new_key, str(v)))
+                except Exception:
+                    pass
+
+        return dict(items)
+
+    async def _extract_device_parameters(self, handle: Any) -> dict[str, Any]:
+        """Extract all relevant parameters from a device handle."""
+        snapshot = handle.snapshot
+        device_state = snapshot.device_state if hasattr(snapshot, "device_state") else None
+
+        parameters: dict[str, Any] = {
+            "device_name": handle.device_name,
+            "device_id": handle.device_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+
+        mqtt_transport = handle._transports.get(TransportType.CLOUD_ALIYUN) or handle._transports.get(  # noqa: SLF001
+            TransportType.CLOUD_MAMMOTION
+        )
+        parameters["mqtt_connected"] = mqtt_transport is not None and mqtt_transport.is_connected
+
+        if device_state is not None:
+            try:
+                state_dict: dict[str, Any] = {}
+                for field_name in dir(device_state):
+                    if not field_name.startswith("_"):
+                        try:
+                            value = getattr(device_state, field_name)
+                            if not callable(value) and not hasattr(value, "__dict__"):
+                                state_dict[field_name] = value
+                        except Exception:
+                            pass
+                parameters["state"] = state_dict
+            except Exception as e:
+                _LOGGER.warning("Error extracting device state: %s", e)
+
+        try:
+            parameters["raw_snapshot"] = json.loads(handle.snapshot.raw.to_json())
+        except Exception:
+            pass
+
+        return parameters
+
+    async def _publish_device_to_external_mqtt(self, device_name: str) -> None:
+        """Publish a single device's current state to the external MQTT broker."""
+        if not self.connected or not self.dev_console:
+            return
+
+        handle = self.dev_console.mammotion.device_registry.get_by_name(device_name)
+        if handle is None:
+            return
+
+        try:
+            parameters = await self._extract_device_parameters(handle)
+
+            state_topic = f"{self.base_topic}/devices/{device_name}/state"
+            if publish_full_state:
+                await self.publish(state_topic, parameters, retain=True, qos=2)
+
+            flat_params = self._flatten_dict(parameters)
+
+            if device_name not in self._previous_state:
+                self._previous_state[device_name] = {}
+
+            previous = self._previous_state[device_name]
+
+            for key, value in flat_params.items():
+                if key in ("state", "raw_snapshot"):
+                    continue
+
+                value_str = str(value)
+
+                if key not in previous or previous[key] != value_str:
+                    field_topic = f"{self.base_topic}/devices/{device_name}/{key}"
+                    await self.publish(field_topic, value_str, retain=False, qos=2)
+                    previous[key] = value_str
+                    _LOGGER.debug(
+                        "Published changed parameter for %s: %s = %s", device_name, key, value_str
+                    )
+
+            _LOGGER.debug("Published device %s to external MQTT with change detection", device_name)
+        except Exception as e:
+            _LOGGER.error("Error publishing device %s to external MQTT: %s", device_name, e)
+
+    async def _execute_publish_all(self, device_name: str, cmd_data: dict) -> None:  # noqa: ARG002
+        """Force publish all parameters for a device."""
+        if not self.dev_console:
+            return
+
+        try:
+            if device_name in self._previous_state:
+                del self._previous_state[device_name]
+
+            await self._publish_device_to_external_mqtt(device_name)
+            response: dict[str, Any] = {
+                "status": "success",
+                "device": device_name,
+                "command": "publish_all",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.info("✓ publish_all executed: %s", device_name)
+        except Exception as e:
+            response = {
+                "status": "error",
+                "device": device_name,
+                "command": "publish_all",
+                "error": str(e),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.error("✗ publish_all failed: %s", e)
+
+        await self.publish(
+            f"{self.base_topic}/devices/{device_name}/publish_all/response",
+            response,
+            retain=False,
+            qos=2,
+        )
+
+    async def _execute_send(self, device_name: str, cmd_data: dict) -> None:
+        """Execute send command."""
+        if not self.dev_console:
+            return
+
+        cmd = cmd_data.get("cmd")
+        kwargs = cmd_data.get("kwargs", {})
+
+        if not cmd:
+            _LOGGER.warning("send: missing 'cmd' field")
+            return
+
+        try:
+            await self.dev_console.mammotion.send_command_with_args(device_name, cmd, **kwargs)
+            response: dict[str, Any] = {
+                "status": "success",
+                "device": device_name,
+                "command": "send",
+                "cmd": cmd,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.info("✓ send executed: %s %s", device_name, cmd)
+        except Exception as e:
+            response = {
+                "status": "error",
+                "device": device_name,
+                "command": "send",
+                "cmd": cmd,
+                "error": str(e),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.error("✗ send failed: %s", e)
+
+        await self.publish(
+            f"{self.base_topic}/devices/{device_name}/send/response",
+            response,
+            retain=False,
+        )
+
+    async def _execute_send_and_wait(self, device_name: str, cmd_data: dict) -> None:
+        """Execute send_and_wait command."""
+        if not self.dev_console:
+            return
+
+        cmd = cmd_data.get("cmd")
+        expected_field = cmd_data.get("expected_field")
+        kwargs = cmd_data.get("kwargs", {})
+        send_timeout = cmd_data.get("send_timeout", 1.0)
+        timeout = cmd_data.get("timeout", 3.0)
+
+        if not cmd or not expected_field:
+            _LOGGER.warning("send_and_wait: missing 'cmd' or 'expected_field'")
+            return
+
+        try:
+            result = await self.dev_console.mammotion.send_command_and_wait(
+                device_name,
+                cmd,
+                expected_field,
+                send_timeout=send_timeout,
+                **kwargs,
+            )
+            response: dict[str, Any] = {
+                "status": "success",
+                "device": device_name,
+                "command": "send_and_wait",
+                "cmd": cmd,
+                "expected_field": expected_field,
+                "result": str(result),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.info("✓ send_and_wait executed: %s %s → %s", device_name, cmd, expected_field)
+        except Exception as e:
+            response = {
+                "status": "error",
+                "device": device_name,
+                "command": "send_and_wait",
+                "cmd": cmd,
+                "expected_field": expected_field,
+                "error": str(e),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.error("✗ send_and_wait failed: %s", e)
+
+        await self.publish(
+            f"{self.base_topic}/devices/{device_name}/send_and_wait/response",
+            response,
+            retain=False,
+        )
+
+    async def _execute_sync_map(self, device_name: str, cmd_data: dict) -> None:
+        """Execute sync_map command."""
+        if not self.dev_console:
+            return
+
+        timeout = cmd_data.get("timeout", 120.0)
+
+        try:
+            await self.dev_console.mammotion.start_map_sync(device_name)
+            response: dict[str, Any] = {
+                "status": "success",
+                "device": device_name,
+                "command": "sync_map",
+                "timeout": timeout,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.info("✓ sync_map enqueued: %s", device_name)
+        except Exception as e:
+            response = {
+                "status": "error",
+                "device": device_name,
+                "command": "sync_map",
+                "error": str(e),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.error("✗ sync_map failed: %s", e)
+
+        await self.publish(
+            f"{self.base_topic}/devices/{device_name}/sync_map/response",
+            response,
+            retain=False,
+        )
+
+    async def _execute_fetch_rtk(self, device_name: str, cmd_data: dict) -> None:  # noqa: ARG002
+        """Execute fetch_rtk command."""
+        if not self.dev_console:
+            return
+
+        try:
+            await self.dev_console.mammotion.fetch_rtk_lora_info(device_name)
+            response: dict[str, Any] = {
+                "status": "success",
+                "device": device_name,
+                "command": "fetch_rtk",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.info("✓ fetch_rtk executed: %s", device_name)
+        except Exception as e:
+            response = {
+                "status": "error",
+                "device": device_name,
+                "command": "fetch_rtk",
+                "error": str(e),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            _LOGGER.error("✗ fetch_rtk failed: %s", e)
+
+        await self.publish(
+            f"{self.base_topic}/devices/{device_name}/fetch_rtk/response",
+            response,
+            retain=False,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _main(args: argparse.Namespace) -> None:
+    _load_env_config()
+    _setup_logging()
+
+    mammotion = MammotionClient(mammotion_client_ha_version)
+    main_loop = asyncio.get_running_loop()
+
+    # Connect external MQTT before cloud login so we can publish failures
+    external_mqtt: ExternalMQTTPublisher | None = None
+    mqtt_host = os.environ.get("EXTERNAL_MQTT_HOST")
+    if mqtt_host:
+        mqtt_port = int(os.environ.get("EXTERNAL_MQTT_PORT", "1883"))
+        mqtt_user = os.environ.get("EXTERNAL_MQTT_USER")
+        mqtt_pass = os.environ.get("EXTERNAL_MQTT_PASS")
+        mqtt_topic = os.environ.get("EXTERNAL_MQTT_TOPIC", "mammotion")
+        external_mqtt = ExternalMQTTPublisher(
+            host=mqtt_host,
+            port=mqtt_port,
+            username=mqtt_user,
+            password=mqtt_pass,
+            base_topic=mqtt_topic,
+        )
+        _LOGGER.info("Connecting to external MQTT Broker [bold]%s[/bold] …", mqtt_host)
+        await external_mqtt.connect()
+
+    dev = DevConsole(
+        mammotion,
+        main_loop,
+        external_mqtt,
+        output_dir=OUTPUT_DIR,
+        always_dump=always_update_dump_files,
+    )
+
+    if args.ble_address:
+        await _bootstrap_ble_only(mammotion, args.ble_address, args.device_name)
+    else:
+        saved_email, saved_password = _load_credentials()
+        email = os.environ.get("EMAIL") or input(f"Mammotion email [{saved_email}]: ").strip() or saved_email
+        password = (
+            os.environ.get("PASSWORD")
+            or input(f"Mammotion password [{'*' * len(saved_password) if saved_password else ''}]: ").strip()
+            or saved_password
+        )
+        _save_credentials(email, password)
+
+        _LOGGER.info("Logging in as [bold]%s[/bold] …", email)
+        try:
+            await mammotion.login_and_initiate_cloud(email, password)
+            _LOGGER.info("Login complete — waiting for MQTT …")
+        except Exception as e:
+            print("Failed to start: " + str(e))
+            if external_mqtt:
+                await external_mqtt.publish(
+                    f"{external_mqtt.base_topic}/mammotion2mqtt/mammotion_status",
+                    payload="Failed to start: " + str(e),
+                    retain=True,
+                )
+            await asyncio.sleep(3)
+            print("Exiting due to error.")
+            sys.exit(1)
+
+        await asyncio.sleep(3)
+
+    dev.hook_all_devices()
+    await dev.start_all_devices()
+    dev.hook_all_rtk_devices()
+
+    if not args.ble_address:
+        await dev.write_errors_to_file()
+
+    if args.listen:
+        for handle in mammotion.device_registry.all_devices:
+            await handle.stop_polling()
+        _LOGGER.info("[bold yellow]Listen-only mode[/bold yellow] — MQTT polling disabled on all devices")
+
+    if not args.ble_address:
+        dev.log_mqtt_credentials()
+    if always_update_dump_files:
+        dev.dump_all()
+
+    if external_mqtt:
+        await dev.publish_all_devices_to_external_mqtt()
+
+    device_names = [h.device_name for h in mammotion.device_registry.all_devices]
+    _LOGGER.info(
+        "Connected. Devices: [bold]%s[/bold]",
+        ", ".join(device_names) or "(none yet)",
+    )
+    _LOGGER.info("Output directory: [bold]%s[/bold]", OUTPUT_DIR)
+
+    if external_mqtt:
+        await external_mqtt.publish(
+            f"{external_mqtt.base_topic}/mammotion2mqtt/mammotion_status",
+            payload="online",
+            retain=False,
+        )
+
+    # ── REPL namespace ────────────────────────────────────────────────────────
+    namespace = {
+        "mammotion": mammotion,
+        "devices": mammotion.device_registry.all_devices,
+        "send": dev.send,
+        "send_and_wait": dev.send_and_wait,
+        "sync_map": dev.sync_map,
+        "fetch_rtk": dev.fetch_rtk,
+        "dump": dev.dump,
+        "dump_all": dev.dump_all,
+        "status": dev.status,
+        "creds": dev.log_mqtt_credentials,
+        "debug": dev.debug,
+        "listen": dev.listen,
+        "publish_all": dev.sync_external_mqtt,
+        "console": dev,
+        "loop": main_loop,
+        "asyncio": asyncio,
+    }
+
+    mqtt_note = (
+        "  [cyan]publish_all()[/cyan]                                     "
+        "— publish all parameters to external MQTT\n"
+        if external_mqtt
+        else ""
+    )
+    listen_note = "  [bold yellow]⚡ Listen-only mode — polling disabled[/bold yellow]\n\n" if args.listen else ""
+    _rich_console.print(
+        "\n[bold green][PyMammotion dev console][/bold green]\n"
+        f"  [cyan]devices[/cyan]  = {device_names}\n\n"
+        f"{listen_note}"
+        "  [cyan]send(name, cmd, **kwargs)[/cyan]                           — queue a command (blocking)\n"
+        "  [cyan]send_and_wait(name, cmd, expected_field, **kwargs)[/cyan]  — send and block for response\n"
+        "  [cyan]sync_map(name)[/cyan]                                      — run a full MapFetchSaga (blocking)\n"
+        "  [cyan]fetch_rtk(name)[/cyan]                                     — fetch LoRa version for an RTK base station\n"
+        "  [cyan]dump(name)[/cyan]                                          — write state_{name}.json\n"
+        "  [cyan]dump_all()[/cyan]                                          — write state JSON for all devices\n"
+        "  [cyan]status()[/cyan]                                            — show connection status\n"
+        "  [cyan]creds()[/cyan]                                            — print all MQTT credentials\n"
+        "  [cyan]debug(on=True)[/cyan]                                     — toggle DEBUG logging on terminal\n"
+        "  [cyan]listen(on=True)[/cyan]                                    — stop/resume MQTT polling on all devices\n"
+        f"{mqtt_note}"
+        f"  [cyan]loop[/cyan]                                                — main asyncio event loop\n"
+        f"\n  Output → [dim]{OUTPUT_DIR}[/dim]\n"
+    )
+
+    def _start_repl() -> None:
+        import IPython as _IPython
+        _IPython.embed(user_ns=namespace, using="asyncio")
+
+    # Run IPython in a thread so the main loop stays alive for MQTT
+    await asyncio.to_thread(_start_repl)
+
+    _LOGGER.info("REPL exited — shutting down.")
+    if external_mqtt:
+        await external_mqtt.disconnect()
+    await mammotion.stop()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="PyMammotion MQTT bridge console")
+    parser.add_argument(
+        "-l", "--listen",
+        action="store_true",
+        help="listen-only mode: connect and receive messages without sending any polls",
+    )
+    parser.add_argument(
+        "--ble-address",
+        metavar="MAC",
+        default=None,
+        help="BLE-only mode: connect to the mower at this MAC address. Skips cloud login / MQTT.",
+    )
+    parser.add_argument(
+        "--device-name",
+        metavar="NAME",
+        default=None,
+        help="Friendly device name (BLE-only mode).  Defaults to Luba-BLE-<MAC suffix>.",
+    )
+    _args = parser.parse_args()
+    try:
+        asyncio.run(_main(_args))
+    except KeyboardInterrupt:
+        pass

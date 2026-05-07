@@ -201,8 +201,18 @@ class MammotionClient:
             work = device.report_data.work
             # path_hash in (0, 1) means "no job" / "job ended".
             has_active_job = work.ub_path_hash != 0 or work.path_hash not in (0, 1)
-            if not has_active_job or device.map.current_mow_path:
+            if not has_active_job:
                 return
+            if device.map.current_mow_path:
+                # Cache exists — validate it against the current active segment hash.
+                # ub_path_hash appears directly as path_packets[0].path_hash inside the
+                # cover-path frames (confirmed via APK HashDataManager and device data).
+                # If ub_path_hash is 0 we can't validate a specific segment, so keep.
+                if work.ub_path_hash == 0 or device.map.has_mow_path_for_hash(work.ub_path_hash):
+                    return  # Cache is valid for the current job segment
+                # Cache exists but doesn't contain the current segment — stale.
+                # Clear it so the saga fetches fresh data below.
+                device.map.invalidate_mow_path(0)
             if handle.queue.is_saga_active:
                 return
             _logger.debug(

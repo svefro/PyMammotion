@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from enum import IntEnum
 
 from pymammotion.data.model.report_info import ConnectData
@@ -298,10 +300,18 @@ NO_REQUEST_MODES = (
     WorkMode.MODE_MANUAL_MOWING,
 )
 
-#: sys_status values that indicate the device is actively moving (mow / return
-#: to dock).  Used to pick the short keep-alive / watchdog interval; everything
-#: else uses the extended idle interval over MQTT (BLE always uses the short one).
-MOWING_ACTIVE_MODES: frozenset[int] = frozenset({WorkMode.MODE_WORKING.value, WorkMode.MODE_RETURNING.value})
+#: sys_status values that indicate a mowing job is active (moving, returning, or
+#: paused mid-job).  Used to: (1) preserve mow-path / zone caches that must not
+#: be cleared until the job ends; (2) pick the short keep-alive / watchdog
+#: interval; (3) detect the job-done transition in maintenance coordinator.
+MOWING_ACTIVE_MODES: frozenset[int] = frozenset(
+    {
+        WorkMode.MODE_WORKING.value,
+        WorkMode.MODE_RETURNING.value,
+        WorkMode.MODE_PAUSE.value,
+        WorkMode.MODE_CHARGING_PAUSE.value,
+    }
+)
 
 
 def device_connection(connect: ConnectData) -> str:

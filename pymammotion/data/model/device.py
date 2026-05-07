@@ -22,6 +22,7 @@ from pymammotion.data.mqtt.properties import ThingPropertiesMessage
 from pymammotion.data.mqtt.status import ThingStatusMessage
 from pymammotion.http.model.http import CheckDeviceVersion
 from pymammotion.proto import DeviceFwInfo, MowToAppInfoT, ReportInfoData, SystemTardStateTunnelMsg, SystemUpdateBufMsg
+from pymammotion.utility.constant import MOWING_ACTIVE_MODES
 from pymammotion.utility.conversions import parse_double
 from pymammotion.utility.device_config import DeviceConfig
 from pymammotion.utility.map import CoordinateConverter
@@ -188,18 +189,20 @@ class MowerDevice(Device):
         if toapp_report_data.fw_info:
             self.update_device_firmwares(toapp_report_data.fw_info)
 
-        if (
-            toapp_report_data.work
-            and (toapp_report_data.work.area >> 16) == 0
-            and toapp_report_data.work.ub_path_hash == 0
-        ):
-            self.work.zone_hashs = []
-            self.events.work_tasks_event.hash_area_map = {}
-            self.events.work_tasks_event.ids = []
-            self.map.invalidate_breakpoint_line(0)
-
         if toapp_report_data.work:
-            self.map.invalidate_mow_path(toapp_report_data.work.path_hash)
+            # A mid-mow restart can produce path_hash=0/1 or ub_path_hash=0 in
+            # the first report before the device re-reports its active hashes.
+            # Guard all state-clearing operations so a transient zero doesn't
+            # wipe live mow data (cover path, zone list, GeoJSON) mid-job.
+            sys_status = toapp_report_data.dev.sys_status if toapp_report_data.dev else 0
+            is_actively_mowing = sys_status in MOWING_ACTIVE_MODES
+            if not is_actively_mowing:
+                if (toapp_report_data.work.area >> 16) == 0 and toapp_report_data.work.ub_path_hash == 0:
+                    self.work.zone_hashs = []
+                    self.events.work_tasks_event.hash_area_map = {}
+                    self.events.work_tasks_event.ids = []
+                    self.map.invalidate_breakpoint_line(0)
+                self.map.invalidate_mow_path(toapp_report_data.work.path_hash)
             self.map.invalidate_breakpoint_line(toapp_report_data.work.ub_path_hash)
 
         self.report_data.update(toapp_report_data)

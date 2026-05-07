@@ -55,6 +55,7 @@ from pymammotion.proto import (
     GetNetworkInfoRsp,
     LoraCfgRsp,
     LubaMsg,
+    MulAudioCfg,
     MulSetAudio,
     NavEdgePoints,
     NavGetAllPlanTask,
@@ -551,6 +552,13 @@ class MowerStateReducer(StateReducer):
                     device.mower_state.audio.language = audio_msg.au_language.name
                 if audio_msg.at_switch is not None:
                     device.mower_state.audio.volume = audio_msg.at_switch
+                if audio_msg.sex is not None:
+                    device.mower_state.audio.sex = audio_msg.sex.value
+            case "audio_cfg":
+                cfg_msg: MulAudioCfg = mul_msg[1]
+                device.mower_state.audio.volume = cfg_msg.au_switch
+                device.mower_state.audio.language = cfg_msg.au_language.name
+                device.mower_state.audio.sex = cfg_msg.sex.value
             case "get_lamp_rsp":
                 lamp_resp: Getlamprsp = mul_msg[1]
                 device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright

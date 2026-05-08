@@ -53,6 +53,7 @@ def _make_mqtt_transport(*, connected: bool = True) -> MagicMock:
     t.on_message = None
     t.add_availability_listener = MagicMock()
     t.last_received_monotonic = 0.0
+    t.last_send_monotonic = 0.0
     return t
 
 
@@ -206,6 +207,7 @@ async def test_ble_transport_not_blocked_by_rate_limited_flag() -> None:
     ble.transport_type = TransportType.BLE
     ble.is_connected = True
     ble.is_rate_limited = False
+    ble.last_send_monotonic = 0.0
     ble.send = AsyncMock()
     ble.set_rate_limited = MagicMock()
     ble.disconnect = AsyncMock()

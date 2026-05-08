@@ -377,6 +377,7 @@ class BLETransport(Transport):
     async def send(self, payload: bytes, iot_id: str = "") -> None:
         """Frame and write payload via the BleMessage codec."""
         _logger.debug("Sending BLE payload: %s, %s iot_id", payload, iot_id)
+        self._last_send_monotonic = time.monotonic()
         await self._write_payload(payload)
 
     # ------------------------------------------------------------------

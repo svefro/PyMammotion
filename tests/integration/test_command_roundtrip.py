@@ -39,6 +39,7 @@ def _make_transport(transport_type: TransportType, *, connected: bool = True) ->
     transport.transport_type = transport_type
     transport.is_connected = connected
     transport.is_rate_limited = False
+    transport.last_send_monotonic = 0.0  # 0.0 = never sent (matches Transport base default)
     transport.send = AsyncMock()
     transport.disconnect = AsyncMock()
     transport.on_message = None
@@ -418,8 +419,8 @@ async def test_ble_sync_sent_before_payload_after_5_minute_idle() -> None:
     mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     handle = _make_handle(mqtt_transport=mqtt_transport)
 
-    # Seed last_send_monotonic to simulate 6 minutes of inactivity
-    handle._last_send_monotonic[TransportType.CLOUD_ALIYUN] = time.monotonic() - 360
+    # Seed the transport's last_send_monotonic to simulate 6 minutes of inactivity
+    mqtt_transport.last_send_monotonic = time.monotonic() - 360
 
     sent: list[bytes] = []
 
@@ -444,8 +445,8 @@ async def test_no_ble_sync_when_recently_active() -> None:
     mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     handle = _make_handle(mqtt_transport=mqtt_transport)
 
-    # Seed last_send_monotonic to simulate 2 minutes of inactivity (under threshold)
-    handle._last_send_monotonic[TransportType.CLOUD_ALIYUN] = time.monotonic() - 120
+    # Seed the transport's last_send_monotonic to simulate 2 minutes of inactivity (under threshold)
+    mqtt_transport.last_send_monotonic = time.monotonic() - 120
 
     sent: list[bytes] = []
 
@@ -465,8 +466,8 @@ async def test_no_ble_sync_on_first_ever_send() -> None:
     mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     handle = _make_handle(mqtt_transport=mqtt_transport)
 
-    # _last_send_monotonic is empty — no previous send for this transport
-    assert TransportType.CLOUD_ALIYUN not in handle._last_send_monotonic
+    # last_send_monotonic == 0.0 means never sent — no sync should fire
+    assert mqtt_transport.last_send_monotonic == 0.0
 
     sent: list[bytes] = []
 

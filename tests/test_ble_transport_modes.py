@@ -25,6 +25,7 @@ def _make_transport(transport_type: TransportType, *, connected: bool = True) ->
     t.transport_type = transport_type
     t.is_connected = connected
     t.is_rate_limited = False
+    t.last_send_monotonic = 0.0
     t.send = AsyncMock()
     t.connect = AsyncMock()
     t.disconnect = AsyncMock()

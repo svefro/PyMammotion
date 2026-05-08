@@ -95,7 +95,6 @@ async def ble_activity_loop(handle: DeviceHandle) -> None:
         cmd_bytes = handle.commands.send_todev_ble_sync(sync_type=_KEEP_ALIVE_SYNC_TYPE_BLE)
         try:
             await ble.send_heartbeat(cmd_bytes, iot_id=handle.iot_id)
-            handle._last_send_monotonic[TransportType.BLE] = time.monotonic()  # noqa: SLF001
             handle._ble_heartbeat_failures = 0  # noqa: SLF001
         except TransportError:
             handle._ble_heartbeat_failures += 1  # noqa: SLF001

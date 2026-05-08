@@ -53,6 +53,8 @@ from pymammotion.proto import (
     Getlamprsp,
     GetMnetInfoRsp,
     GetNetworkInfoRsp,
+    LampCtrlSta,
+    LampManualCtrlSta,
     LoraCfgRsp,
     LubaMsg,
     MulAudioCfg,
@@ -564,14 +566,12 @@ class MowerStateReducer(StateReducer):
                 device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright
                 if lamp_resp.get_ids in (1126, 1127):
                     device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright
-                    device.mower_state.lamp_info.manual_light = bool(lamp_resp.lamp_manual_ctrl.value) or bool(
-                        lamp_resp.lamp_bright
+                    device.mower_state.lamp_info.manual_light = (
+                        lamp_resp.lamp_manual_ctrl == LampManualCtrlSta.manual_power_on
                     )
                 if lamp_resp.get_ids == 1123:
                     device.mower_state.lamp_info.lamp_bright = lamp_resp.lamp_bright
-                    device.mower_state.lamp_info.night_light = bool(lamp_resp.lamp_ctrl.value) or bool(
-                        lamp_resp.lamp_bright
-                    )
+                    device.mower_state.lamp_info.night_light = lamp_resp.lamp_ctrl == LampCtrlSta.power_ctrl_on
 
     def apply_properties(self, current: MowingDevice, properties: ThingPropertiesMessage) -> MowingDevice:
         """Extract mower state from a thing/properties JSON push.

@@ -230,6 +230,8 @@ class Transport(ABC):
         self._rate_limited_until: float = 0.0
         #: Rolling log of outbound send timestamps for the 24-hour send budget.
         self._send_timestamps: collections.deque[float] = collections.deque()
+        #: Monotonic timestamp of the most recent outbound send (0.0 = never sent).
+        self._last_send_monotonic: float = 0.0
 
     @property
     def on_message(self) -> Callable[[bytes], Awaitable[None]] | None:
@@ -252,6 +254,11 @@ class Transport(ABC):
     def last_received_monotonic(self) -> float:
         """Monotonic timestamp of the last inbound message (0.0 if none yet)."""
         return self._last_received_monotonic
+
+    @property
+    def last_send_monotonic(self) -> float:
+        """Monotonic timestamp of the last outbound send (0.0 if never sent)."""
+        return self._last_send_monotonic
 
     def record_error(self) -> None:
         """Record an error occurrence at the current time.
@@ -335,6 +342,7 @@ class Transport(ABC):
         is called automatically so the next send attempt is blocked immediately.
         """
         now = time.monotonic()
+        self._last_send_monotonic = now
         self._send_timestamps.append(now)
         cutoff = now - self._SEND_WINDOW
         while self._send_timestamps and self._send_timestamps[0] < cutoff:

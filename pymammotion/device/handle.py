@@ -203,10 +203,6 @@ class DeviceHandle:
         self._readiness_checker: ReadinessChecker | None = readiness_checker
         self._stopping: bool = False
         self._keep_alive_task: asyncio.Task[None] | None = None
-        #: monotonic timestamp of the last outbound send per transport, used by
-        #: ``_activity_loop`` to skip heartbeats when the transport has seen
-        #: recent activity (set via ``_send_marked``).
-        self._last_send_monotonic: dict[TransportType, float] = {}
         #: monotonic timestamp of the last user-initiated command (updated via
         #: ``record_user_command``; heartbeats and internal sends do NOT update
         #: this).  Used to wake the poll loop early via ``_rearm_event``.
@@ -339,14 +335,13 @@ class DeviceHandle:
                 f"Transport {transport.transport_type.value} is rate-limited — send blocked"
             )
 
-        last = self._last_send_monotonic.get(transport.transport_type)
-        if last is not None and time.monotonic() - last > 300:
+        last = transport.last_send_monotonic
+        if last != 0.0 and time.monotonic() - last > 300:
             # No commands sent for 5 minutes — prepend a BLE sync so the
             # device knows we are still connected before the real payload.
             sync = self.commands.send_todev_ble_sync(sync_type=3)
             await transport.send(sync, iot_id=self.iot_id)
 
-        self._last_send_monotonic[transport.transport_type] = time.monotonic()
         await transport.send(payload, iot_id=self.iot_id)
 
     async def _on_critical_error(self, error: Exception) -> None:

@@ -192,6 +192,7 @@ async def test_send_command_with_args_succeeds_for_known_device() -> None:
     mqtt_transport = MagicMock()
     mqtt_transport.transport_type = TransportType.CLOUD_ALIYUN
     mqtt_transport.is_connected = True
+    mqtt_transport.last_send_monotonic = 0.0
     mqtt_transport.send = AsyncMock()
 
     handle = make_handle("dev1", "Luba-Runner")
@@ -241,6 +242,7 @@ def _make_mock_transport(transport_type: TransportType = TransportType.CLOUD_ALI
     t = MagicMock()
     t.transport_type = transport_type
     t.is_connected = True
+    t.last_send_monotonic = 0.0
     t.send = AsyncMock()
     t.disconnect = AsyncMock()
     t.on_message = None
@@ -450,6 +452,7 @@ def _make_connected_transport(transport_type: TransportType) -> MagicMock:
     t.on_message = None
     t.add_availability_listener = MagicMock()
     t.last_received_monotonic = 0.0
+    t.last_send_monotonic = 0.0
     return t
 
 

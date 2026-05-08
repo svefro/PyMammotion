@@ -126,27 +126,21 @@ class MessageSystem(AbstractMessage, ABC):
         return self.send_order_msg_sys(MctlSys(device_product_type_info=DeviceProductTypeInfoT(result=1)))
 
     def read_and_set_sidelight(self, is_sidelight: bool, operate: int) -> bytes:
-        """Read state of sidelight as well as set it."""
-        if is_sidelight:
-            build = TimeCtrlLight(
-                operate=operate,
-                enable=0,
-                action=0,
-                start_hour=0,
-                start_min=0,
-                end_hour=0,
-                end_min=0,
-            )
-        else:
-            build = TimeCtrlLight(
-                operate=operate,
-                enable=1,
-                action=0,
-                start_hour=0,
-                start_min=0,
-                end_hour=0,
-                end_min=0,
-            )
+        """Read or set the side LED.
+
+        is_sidelight=True  → enable=1 (light on)
+        is_sidelight=False → enable=0 (light off)
+        operate=0 → write (set), operate=1 → read (query current state).
+        """
+        build = TimeCtrlLight(
+            operate=operate,
+            enable=1 if is_sidelight else 0,
+            action=0,
+            start_hour=0,
+            start_min=0,
+            end_hour=0,
+            end_min=0,
+        )
         logger.debug(f"Send read and write sidelight command is_sidelight:{is_sidelight}, operate:{operate}")
         build2 = MctlSys(todev_time_ctrl_light=build)
         logger.debug(
@@ -641,8 +635,6 @@ class MessageSystem(AbstractMessage, ABC):
         ``biz_id`` identifies the transfer session; ``result`` is the per-frame
         error code (0 = OK); ``progress`` is the transfer progress percentage.
         """
-        build = MctlSys(
-            task_report_resp=FileTransferResponse(biz_id=biz_id, result=result, progress=progress)
-        )
+        build = MctlSys(task_report_resp=FileTransferResponse(biz_id=biz_id, result=result, progress=progress))
         logger.debug(f"Send command - Confirm report biz_id={biz_id}, result={result}, progress={progress}")
         return self.send_order_msg_sys(build)

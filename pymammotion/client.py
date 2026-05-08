@@ -1907,16 +1907,6 @@ class MammotionClient:
         is_yuka = DeviceType.is_yuka(device_name)
         subscription = await http.get_stream_subscription(iot_id, is_yuka)
 
-        if handle := self._device_registry.get_by_name(device_name):
-            try:
-                new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None
-            except AttributeError:
-                new_fpv = False
-            if not new_fpv:
-                await self.send_command_and_wait(
-                    device_name, "device_agora_join_channel_with_position", "set_video_ack", enter_state=1
-                )
-
         return subscription
 
     async def refresh_stream_subscription(self, device_name: str, iot_id: str) -> Any:
@@ -1934,16 +1924,6 @@ class MammotionClient:
             return None
         is_yuka = DeviceType.is_yuka(device_name)
         subscription = await http.get_stream_subscription(iot_id, is_yuka)
-
-        if handle := self._device_registry.get_by_name(device_name):
-            try:
-                new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None
-            except AttributeError:
-                new_fpv = False
-            if not new_fpv:
-                await self.send_command_and_wait(
-                    device_name, "device_agora_join_channel_with_position", "set_video_ack", enter_state=1
-                )
 
         return subscription
 

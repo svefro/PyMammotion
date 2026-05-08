@@ -400,3 +400,82 @@ async def test_map_saga_refetches_area_names_on_each_run() -> None:
     assert len(area_name_calls) == 2, (
         f"Expected area name command called once per run (2 total), got {len(area_name_calls)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# BLE sync prepend after 5 minutes of inactivity
+# ---------------------------------------------------------------------------
+
+
+async def test_ble_sync_sent_before_payload_after_5_minute_idle() -> None:
+    """_send_marked must prepend a BLE sync when no command was sent for > 5 minutes.
+
+    The sync is sent directly, immediately before the payload — not queued
+    separately, so ordering is guaranteed even under queue backpressure.
+    """
+    import time
+
+    mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+    handle = _make_handle(mqtt_transport=mqtt_transport)
+
+    # Seed last_send_monotonic to simulate 6 minutes of inactivity
+    handle._last_send_monotonic[TransportType.CLOUD_ALIYUN] = time.monotonic() - 360
+
+    sent: list[bytes] = []
+
+    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+        sent.append(payload)
+
+    mqtt_transport.send.side_effect = capture_send
+
+    # Directly call _send_marked (the path used inside send_command)
+    await handle._send_marked(mqtt_transport, b"\xde\xad")
+
+    assert len(sent) == 2, f"Expected sync + payload (2 sends), got {len(sent)}: {sent}"
+    # First send is the BLE sync (send_todev_ble_sync returns non-empty bytes)
+    assert sent[0] != b"\xde\xad", "First send should be the BLE sync, not the payload"
+    assert sent[1] == b"\xde\xad", "Second send should be the actual payload"
+
+
+async def test_no_ble_sync_when_recently_active() -> None:
+    """_send_marked must NOT prepend a sync when the last command was < 5 minutes ago."""
+    import time
+
+    mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+    handle = _make_handle(mqtt_transport=mqtt_transport)
+
+    # Seed last_send_monotonic to simulate 2 minutes of inactivity (under threshold)
+    handle._last_send_monotonic[TransportType.CLOUD_ALIYUN] = time.monotonic() - 120
+
+    sent: list[bytes] = []
+
+    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+        sent.append(payload)
+
+    mqtt_transport.send.side_effect = capture_send
+
+    await handle._send_marked(mqtt_transport, b"\xca\xfe")
+
+    assert len(sent) == 1, f"Expected only payload (1 send), got {len(sent)}: {sent}"
+    assert sent[0] == b"\xca\xfe"
+
+
+async def test_no_ble_sync_on_first_ever_send() -> None:
+    """_send_marked must NOT prepend a sync when no previous send exists (first ever command)."""
+    mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+    handle = _make_handle(mqtt_transport=mqtt_transport)
+
+    # _last_send_monotonic is empty — no previous send for this transport
+    assert TransportType.CLOUD_ALIYUN not in handle._last_send_monotonic
+
+    sent: list[bytes] = []
+
+    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+        sent.append(payload)
+
+    mqtt_transport.send.side_effect = capture_send
+
+    await handle._send_marked(mqtt_transport, b"\x01\x02")
+
+    assert len(sent) == 1
+    assert sent[0] == b"\x01\x02"

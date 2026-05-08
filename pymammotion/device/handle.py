@@ -339,32 +339,15 @@ class DeviceHandle:
                 f"Transport {transport.transport_type.value} is rate-limited — send blocked"
             )
 
-        if (
-            transport.transport_type in self._last_send_monotonic
-            and time.monotonic() - self._last_send_monotonic[transport.transport_type] > 300
-        ):
+        last = self._last_send_monotonic.get(transport.transport_type)
+        if last is not None and time.monotonic() - last > 300:
+            # No commands sent for 5 minutes — prepend a BLE sync so the
+            # device knows we are still connected before the real payload.
             sync = self.commands.send_todev_ble_sync(sync_type=3)
-
-            async def _send_ble() -> None:
-                await transport.send(sync, iot_id=self.iot_id)
-
-            await self.queue.enqueue(
-                lambda: _send_ble(),
-                priority=Priority.NORMAL,
-                skip_if_saga_active=False,
-            )
+            await transport.send(sync, iot_id=self.iot_id)
 
         self._last_send_monotonic[transport.transport_type] = time.monotonic()
         await transport.send(payload, iot_id=self.iot_id)
-
-        async def _send() -> None:
-            await transport.send(payload, iot_id=self.iot_id)
-
-        await self.queue.enqueue(
-            lambda: _send(),
-            priority=Priority.NORMAL,
-            skip_if_saga_active=False,
-        )
 
     async def _on_critical_error(self, error: Exception) -> None:
         """Propagate critical errors to the error bus."""

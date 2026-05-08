@@ -665,6 +665,21 @@ class MessageNavigation(AbstractMessage, ABC):
 
         return self.send_order_msg_nav(build)
 
+    def send_svg_response(self, total_frame: int, current_frame: int, data_hash: int, paternal_hash_a: int) -> bytes:
+        """Ack a received SVG frame so the device sends the next one (sub_cmd=2)."""
+        build = MctlNav(
+            todev_svg_msg=SvgMessageAckT(
+                pver=1,
+                sub_cmd=2,
+                total_frame=total_frame,
+                current_frame=current_frame,
+                data_hash=data_hash,
+                paternal_hash_a=paternal_hash_a,
+            )
+        )
+        logger.debug("Send command--SVG response frame=%d/%d hash=%d", current_frame, total_frame, data_hash)
+        return self.send_order_msg_nav(build)
+
     # === Corridor recording (MN231) ===
 
     def start_draw_corridor(self) -> bytes:

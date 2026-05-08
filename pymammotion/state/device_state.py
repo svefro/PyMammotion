@@ -104,6 +104,23 @@ class ConnectionStateChangedEvent:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class DeviceShutdownEvent:
+    """Emitted when the device sends a mow_to_app_info shutdown notification.
+
+    The device broadcasts this immediately before powering off, giving
+    subscribers the earliest possible signal to mark the device unavailable
+    rather than waiting for the MQTT heartbeat timeout.
+
+    power_type is mow_data[0] from the proto — the shutdown reason code
+    (e.g. button press, low battery).  The APK treats all values uniformly;
+    we surface it for diagnostics only.
+    """
+
+    device_id: str
+    power_type: int
+
+
 class DeviceStateMachine:
     """Manages device state as an append-only sequence of immutable snapshots.
 

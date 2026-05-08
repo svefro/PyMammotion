@@ -37,6 +37,7 @@ class _QueueItem:
     sequence: int
     work: Callable[[], Awaitable[None]] = field(compare=False)
     skip_if_saga_active: bool = field(compare=False, default=False)
+    dedup_key: str | None = field(compare=False, default=None)
 
 
 class DeviceCommandQueue:
@@ -58,6 +59,7 @@ class DeviceCommandQueue:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._device_name = device_name
+        self._pending_dedup_keys: set[str] = set()
         #: Called on critical errors (AuthError, SagaFailedError) so DeviceHandle can propagate them.
         self.on_critical_error: Callable[[Exception], Awaitable[None]] | None = None
         #: Fired when an exclusive saga is about to start.  Clients use this to pause the
@@ -94,12 +96,17 @@ class DeviceCommandQueue:
         priority: Priority = Priority.NORMAL,
         *,
         skip_if_saga_active: bool = False,
+        dedup_key: str | None = None,
     ) -> None:
         """Add work to the queue.
 
         If skip_if_saga_active=True and a saga is active, the item is dropped
         silently. This is correct for HA coordinator polls — they must not
         accumulate during a multi-minute map sync.
+
+        If dedup_key is given and an item with that key is already pending,
+        the new item is silently dropped. Use for idempotent commands like
+        RPT_START that should only be queued once at a time.
         """
         # EMERGENCY is never skipped or blocked
         if priority == Priority.EMERGENCY:
@@ -108,13 +115,19 @@ class DeviceCommandQueue:
         if skip_if_saga_active and self.is_saga_active and priority > Priority.EXCLUSIVE:
             return
 
+        if dedup_key is not None and dedup_key in self._pending_dedup_keys:
+            return
+
         self._seq += 1
         item = _QueueItem(
             priority=int(priority),
             sequence=self._seq,
             work=work,
             skip_if_saga_active=skip_if_saga_active,
+            dedup_key=dedup_key,
         )
+        if dedup_key is not None:
+            self._pending_dedup_keys.add(dedup_key)
         await self._queue.put(item)
 
     async def enqueue_saga(
@@ -142,7 +155,15 @@ class DeviceCommandQueue:
                     raise
                 except Exception as exc:
                     saga_exception = exc
-                    _logger.exception("Saga '%s' raised an unhandled exception", saga.name)
+                    # GatewayTimeoutException and DeviceOfflineException are
+                    # expected operational errors handled by the _process retry
+                    # loop — logging them here as "unhandled" is misleading noise.
+                    from pymammotion.aliyun.exceptions import GatewayTimeoutException
+
+                    if not isinstance(
+                        exc, (GatewayTimeoutException, DeviceOfflineException, NoTransportAvailableError)
+                    ):
+                        _logger.exception("Saga '%s' raised an unhandled exception", saga.name)
                     raise
             finally:
                 # Always release the exclusive lock and clear the work-task pointer,
@@ -172,6 +193,10 @@ class DeviceCommandQueue:
                 break
 
             try:
+                # Release dedup slot as soon as item is dequeued
+                if item.dedup_key is not None:
+                    self._pending_dedup_keys.discard(item.dedup_key)
+
                 # Non-emergency items yield to an active exclusive op
                 if item.priority > Priority.EXCLUSIVE:
                     await self._exclusive_active.wait()

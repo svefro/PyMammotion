@@ -769,40 +769,42 @@ def _make_aliyun_session(iot_token: str = "initial-tok") -> tuple:
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_full_relogin_succeeds_updates_token_returns_true() -> None:
-    """Happy path: _full_relogin succeeds → token pushed explicitly → True.
+async def test_on_aliyun_auth_failure_targeted_refresh_succeeds_no_full_relogin() -> None:
+    """Happy path: targeted refresh succeeds → token pushed → True, login_v2 NOT called.
 
-    The callback (on_aliyun_token_refreshed) is the primary propagation path, but an
-    explicit get_aliyun_credentials + update_iot_token call acts as a safety net for
-    cases where force_refresh skips _refresh_aliyun (e.g. cloud_gateway is None).
+    When the iotToken simply expired (2043/460) but the refreshToken is still valid,
+    check_or_refresh_session is sufficient.  _full_relogin (login_v2) must NOT fire
+    because that would hammer the API unnecessarily and risk triggering an account block.
     """
     client, session, transport = _make_aliyun_session("old-tok")
 
     new_creds = MagicMock()
     new_creds.iot_token = "fresh-tok"
 
-    login_resp = MagicMock()
-    login_resp.code = 0
-    session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
-    session.token_manager.force_refresh = AsyncMock()
+    session.token_manager.refresh_aliyun_credentials = AsyncMock()  # succeeds
     session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
+    session.mammotion_http.login_v2 = AsyncMock()
 
     result = await transport.on_auth_failure()
 
     assert result is True
     assert transport._iot_token == "fresh-tok"
-    session.mammotion_http.login_v2.assert_awaited_once()
+    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
+    session.mammotion_http.login_v2.assert_not_awaited()
     session.token_manager.get_aliyun_credentials.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_full_relogin_updates_token_and_returns_true() -> None:
-    """_full_relogin succeeds → token explicitly updated → True."""
+async def test_on_aliyun_auth_failure_full_relogin_after_exhausted_refresh_token() -> None:
+    """When refreshToken is exhausted, escalate to _full_relogin → token updated → True."""
     client, session, transport = _make_aliyun_session("old-tok")
 
     new_creds = MagicMock()
     new_creds.iot_token = "post-relogin-tok"
 
+    session.token_manager.refresh_aliyun_credentials = AsyncMock(
+        side_effect=ReLoginRequiredError("test@example.com", "refreshToken exhausted")
+    )
     login_resp = MagicMock()
     login_resp.code = 0
     session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
@@ -813,20 +815,19 @@ async def test_on_aliyun_auth_failure_full_relogin_updates_token_and_returns_tru
 
     assert result is True
     assert transport._iot_token == "post-relogin-tok"
+    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
     session.mammotion_http.login_v2.assert_awaited_once()
     session.token_manager.get_aliyun_credentials.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_relogin_fails_raises_relogin_required() -> None:
-    """_full_relogin fails → ReLoginRequiredError raised.
-
-    The exception propagates through aliyun_mqtt's except-Exception handler,
-    which sets stop_event and raises AuthError — the signal to HA that the user
-    must re-enter credentials.
-    """
+async def test_on_aliyun_auth_failure_both_paths_fail_raises_relogin_required() -> None:
+    """targeted refresh + _full_relogin both fail → ReLoginRequiredError raised."""
     client, session, transport = _make_aliyun_session("old-tok")
 
+    session.token_manager.refresh_aliyun_credentials = AsyncMock(
+        side_effect=ReLoginRequiredError("test@example.com", "exhausted")
+    )
     login_resp = MagicMock()
     login_resp.code = 401
     login_resp.msg = "invalid credentials"
@@ -836,35 +837,32 @@ async def test_on_aliyun_auth_failure_relogin_fails_raises_relogin_required() ->
         await transport.on_auth_failure()
 
     assert transport._iot_token == "old-tok"  # not updated
+    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
     session.mammotion_http.login_v2.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_on_aliyun_auth_failure_never_calls_targeted_refresh() -> None:
-    """on_auth_failure must NOT call refresh_aliyun_credentials.
+async def test_on_aliyun_auth_failure_calls_targeted_refresh_before_full_relogin() -> None:
+    """on_auth_failure must call refresh_aliyun_credentials first.
 
-    The old implementation called refresh_aliyun_credentials first; when the refreshToken
-    was also invalid (code 2401 → SessionExpiredError) this caused ~1300 retries/hour:
-      bind-fail (2043) → targeted refresh → 2401 → bind-fail again → ...
-
-    The fix goes straight to full re-login.  This test guards against that regression.
+    The targeted refresh (check_or_refresh_session) is the lightweight path that
+    works whenever the iotToken expired but the refreshToken is still valid.
+    Skipping it and going straight to _full_relogin (login_v2) fires unnecessary
+    API calls that can trigger an account block on Aliyun.
     """
     client, session, transport = _make_aliyun_session("old-tok")
 
-    session.token_manager.refresh_aliyun_credentials = AsyncMock()
-
-    login_resp = MagicMock()
-    login_resp.code = 0
-    session.mammotion_http.login_v2 = AsyncMock(return_value=login_resp)
-    session.token_manager.force_refresh = AsyncMock()
     new_creds = MagicMock()
     new_creds.iot_token = "renewed-tok"
+    session.token_manager.refresh_aliyun_credentials = AsyncMock()  # succeeds
     session.token_manager.get_aliyun_credentials = AsyncMock(return_value=new_creds)
+    session.mammotion_http.login_v2 = AsyncMock()
 
     await transport.on_auth_failure()
 
-    # The targeted refresh is never called — only _full_relogin via force_refresh.
-    session.token_manager.refresh_aliyun_credentials.assert_not_awaited()
+    # Targeted refresh is called; _full_relogin (login_v2) is NOT called.
+    session.token_manager.refresh_aliyun_credentials.assert_awaited_once()
+    session.mammotion_http.login_v2.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -891,15 +889,17 @@ async def test_on_aliyun_auth_failure_no_token_manager_returns_false() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_reply_2043_relogin_failure_raises_relogin_required_end_to_end() -> None:
-    """Full cascade: bind_reply 2043 → on_auth_failure → _full_relogin fails →
+    """Full cascade: bind_reply 2043 → targeted refresh fails → _full_relogin fails →
     ReLoginRequiredError propagates out of _run().
 
-    refresh_aliyun_credentials is never called — that was the source of the 2401 retry loop.
-    on_fatal_auth_error fires (and fails silently), then ReLoginRequiredError re-raises.
+    Targeted refresh is attempted first (lighter path).  When it raises
+    ReLoginRequiredError, _full_relogin is called.  Both fail → error propagates.
     """
     client, session, transport = _make_aliyun_session("stale-tok")
 
-    session.token_manager.refresh_aliyun_credentials = AsyncMock()
+    session.token_manager.refresh_aliyun_credentials = AsyncMock(
+        side_effect=ReLoginRequiredError("test@example.com", "refreshToken exhausted")
+    )
     login_resp = MagicMock()
     login_resp.code = 500
     login_resp.msg = "server error"
@@ -912,14 +912,15 @@ async def test_bind_reply_2043_relogin_failure_raises_relogin_required_end_to_en
             await transport._run()
 
     assert transport._stop_event.is_set()
-    session.token_manager.refresh_aliyun_credentials.assert_not_awaited()
+    # Targeted refresh was called first
+    session.token_manager.refresh_aliyun_credentials.assert_awaited()
     # login_v2 called twice: once from on_auth_failure, once from on_fatal_auth_error
     assert session.mammotion_http.login_v2.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_bind_reply_2043_relogin_success_fires_on_fatal_auth_and_reconnects() -> None:
-    """bind_reply 2043 → on_auth_failure fails → on_fatal_auth_error fires → reconnect succeeds."""
+    """bind_reply 2043 → targeted refresh fails → _full_relogin fails → on_fatal_auth_error fires."""
     client, session, transport = _make_aliyun_session("stale-tok")
 
     fatal_calls: list[ReLoginRequiredError] = []
@@ -929,7 +930,10 @@ async def test_bind_reply_2043_relogin_success_fires_on_fatal_auth_and_reconnect
 
     transport.on_fatal_auth_error = _on_fatal
 
-    # _on_aliyun_auth_failure: full relogin fails → ReLoginRequiredError
+    # Targeted refresh exhausted, full re-login also fails
+    session.token_manager.refresh_aliyun_credentials = AsyncMock(
+        side_effect=ReLoginRequiredError("test@example.com", "exhausted")
+    )
     login_resp_fail = MagicMock()
     login_resp_fail.code = 500
     login_resp_fail.msg = "server error"

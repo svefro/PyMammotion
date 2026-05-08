@@ -1,5 +1,6 @@
 """Module for interacting with Aliyun Cloud IoT Gateway."""
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -98,6 +99,11 @@ class CloudIOTGateway:
         # _rate_limit_backoff doubles on each successive 429 (60 s → 120 s → …).
         self._rate_limited_until: float = 0.0
         self._rate_limit_backoff: float = 60.0
+        # Serialises concurrent check_or_refresh_session calls so only one
+        # HTTP round-trip fires even when multiple coroutines race on an
+        # expired token.  The second waiter re-checks freshness under the
+        # lock and returns early if the first caller already refreshed.
+        self._refresh_lock: asyncio.Lock = asyncio.Lock()
         self._client_id = self.generate_hardware_string(8)  # 8 characters
         self._device_sn = self.generate_hardware_string(32)  # 32 characters
         self._utdid = self.generate_hardware_string(32)  # 32 characters
@@ -511,77 +517,110 @@ class CloudIOTGateway:
         response_body_dict = self.parse_json_response(response_body_str)
         return response_body_dict
 
-    async def check_or_refresh_session(self) -> None:
-        """Check or refresh the session."""
-        logger.debug("Trying to refresh token")
-        config = Config(
-            app_key=self._app_key, app_secret=self._app_secret, domain=self._region_response.data.apiGatewayEndpoint
-        )
-        client = Client(config)
+    async def check_or_refresh_session(self, *, force: bool = False) -> None:
+        """Check or refresh the Aliyun IoT session token.
 
-        # build request
-        request = CommonParams(api_ver="1.0.4", language="en-US")
-        body = IoTApiRequest(
-            id=str(uuid.uuid4()),
-            params={
-                "request": {
-                    "refreshToken": self._session_by_authcode_response.data.refreshToken,
-                    "identityId": self._session_by_authcode_response.data.identityId,
-                }
-            },
-            request=request,
-            version="1.0",
-        )
+        Serialised by ``_refresh_lock`` so concurrent callers (e.g. the MQTT
+        reconnect loop and a simultaneous send_cloud_command expiry check) do
+        not race to rotate the refreshToken.  The second waiter re-checks
+        token freshness under the lock and returns early if the first caller
+        already refreshed, avoiding unnecessary HTTP calls and token rotations
+        that would cause 460 "iotToken blank" or 2401 "refreshToken invalid"
+        cascades.
 
-        # send request
-        # possibly need to do this ourselves
-        response = await client.async_do_request(
-            "/account/checkOrRefreshSession",
-            "https",
-            "POST",
-            None,
-            body,
-            RuntimeOptions(),
-        )
-        logger.debug(response.status_message)
-        logger.debug(response.headers)
-        logger.debug(response.status_code)
-        logger.debug(response.body)
+        Args:
+            force: When True, skip the freshness re-check and always hit the
+                   network.  Use when the token was explicitly rejected by
+                   Aliyun (e.g. 460 on a fresh token, meaning the account is
+                   rate-limited/blocked) so the token is invalidated server-side
+                   even though our local expiry clock says it is still valid.
 
-        # Decode the response body
-        response_body_str = response.body.decode("utf-8")
+        """
+        # Snapshot the issued-at timestamp before queuing for the lock.
+        # If another coroutine refreshes while we wait, the timestamp will
+        # change and we can exit early without making a redundant HTTP call —
+        # even when force=True.
+        issued_at_snapshot = self._iot_token_issued_at
 
-        # Load the JSON string into a dictionary
-        response_body_dict = self.parse_json_response(response_body_str)
+        async with self._refresh_lock:
+            # A refresh completed while we were queued: use that result.
+            if self._iot_token_issued_at != issued_at_snapshot:
+                return
+            # Standard freshness re-check for non-force callers (expiry path).
+            if not force and (
+                self._session_by_authcode_response is not None
+                and self._session_by_authcode_response.data is not None
+                and self._iot_token_issued_at + self._session_by_authcode_response.data.iotTokenExpire
+                > int(time.time()) + 3600
+            ):
+                return
 
-        if int(response_body_dict.get("code")) != 200:
-            logger.error(response_body_dict)
-            await self.sign_out()
-            raise SessionExpiredError(
-                TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
+            logger.debug("Trying to refresh token")
+            config = Config(
+                app_key=self._app_key,
+                app_secret=self._app_secret,
+                domain=self._region_response.data.apiGatewayEndpoint,
+            )
+            client = Client(config)
+
+            # build request
+            request = CommonParams(api_ver="1.0.4", language="en-US")
+            body = IoTApiRequest(
+                id=str(uuid.uuid4()),
+                params={
+                    "request": {
+                        "refreshToken": self._session_by_authcode_response.data.refreshToken,
+                        "identityId": self._session_by_authcode_response.data.identityId,
+                    }
+                },
+                request=request,
+                version="1.0",
             )
 
-        if response_body_dict.get("code") == 2401:
-            await self.sign_out()
-            raise SessionExpiredError(
-                TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
+            response = await client.async_do_request(
+                "/account/checkOrRefreshSession",
+                "https",
+                "POST",
+                None,
+                body,
+                RuntimeOptions(),
             )
+            logger.debug(response.status_message)
+            logger.debug(response.headers)
+            logger.debug(response.status_code)
+            logger.debug(response.body)
 
-        session = SessionByAuthCodeResponse.from_dict(response_body_dict)
-        session_data = session.data
+            response_body_str = response.body.decode("utf-8")
+            response_body_dict = self.parse_json_response(response_body_str)
 
-        if (
-            session_data is None
-            or session_data.identityId is None
-            or session_data.refreshTokenExpire is None
-            or session_data.iotToken is None
-            or session_data.iotTokenExpire is None
-            or session_data.refreshToken is None
-        ):
-            raise CloudSetupError("Error refreshing token: response is missing required session fields")
+            if int(response_body_dict.get("code")) != 200:
+                logger.error(response_body_dict)
+                await self.sign_out()
+                raise SessionExpiredError(
+                    TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
+                )
 
-        self._session_by_authcode_response = session
-        self._iot_token_issued_at = int(time.time())
+            if response_body_dict.get("code") == 2401:
+                await self.sign_out()
+                raise SessionExpiredError(
+                    TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
+                )
+
+            session = SessionByAuthCodeResponse.from_dict(response_body_dict)
+            session_data = session.data
+
+            if (
+                session_data is None
+                or session_data.identityId is None
+                or session_data.refreshTokenExpire is None
+                or session_data.iotToken is None
+                or session_data.iotTokenExpire is None
+                or session_data.refreshToken is None
+            ):
+                raise CloudSetupError("Error refreshing token: response is missing required session fields")
+
+            self._session_by_authcode_response = session
+            self._iot_token_issued_at = int(time.time())
 
     async def list_binding_by_account(self) -> ListingDevAccountResponse:
         """List bindings by account."""
@@ -974,7 +1013,7 @@ class CloudIOTGateway:
         return ThingPropertiesResponse.from_dict(response_body_dict)
 
     @property
-    def devices_by_account_response(self):
+    def devices_by_account_response(self) -> ListingDevAccountResponse | None:
         """Return the cached device listing response for the current account."""
         return self._devices_by_account_response
 

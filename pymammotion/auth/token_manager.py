@@ -336,7 +336,7 @@ class TokenManager:
             raise ReLoginRequiredError(self._account_id, "No Aliyun cloud gateway configured")
         try:
             try:
-                await self._cloud_gateway.check_or_refresh_session()
+                await self._cloud_gateway.check_or_refresh_session(force=True)
                 # Successful session check — clear any accumulated failure timestamps.
                 self._aliyun_refresh_failures.clear()
             except SessionExpiredError:

@@ -218,7 +218,7 @@ class VioState(IntEnum):
     SIGNAL_BAD = 3
 
     @classmethod
-    def _missing_(cls, value: object) -> "VioState":
+    def _missing_(cls, value: object) -> VioState:
         """Return :data:`SIGNAL_UNKNOWN` for values outside the documented range."""
         return cls.SIGNAL_UNKNOWN
 

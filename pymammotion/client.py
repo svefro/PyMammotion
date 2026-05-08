@@ -1102,21 +1102,32 @@ class MammotionClient:
         token_manager = acct_session.token_manager
 
         async def _on_aliyun_auth_failure() -> bool:
-            """Handle a 2043 bind rejection by performing a full re-login.
+            """Handle a 2043/460 bind rejection.
 
-            A 2043 means the current iotToken is invalid.  Rather than attempting a
-            targeted Aliyun credential refresh first (which risks looping when the
-            refreshToken is also stale — 2401), we go straight to a full email/password
-            re-login so fresh credentials are obtained in one step.
+            Strategy:
+            1. Try a targeted Aliyun credential refresh (check_or_refresh_session).
+               This is sufficient when the iotToken simply expired or Aliyun returned
+               460 "iotToken blank" — the refreshToken is still valid.
+            2. Only if that raises ReLoginRequiredError (refreshToken also exhausted /
+               account blocked after repeated failures) do we escalate to a full
+               email/password re-login.  Skipping straight to _full_relogin on every
+               2043/460 fires unnecessary login_v2 calls that hammer Aliyun further
+               and extend any account block.
             """
             if token_manager is None:
                 return False
-            _logger.warning("Aliyun bind rejected (2043) — performing full re-login")
+            _logger.warning("Aliyun bind rejected — attempting targeted credential refresh")
+            try:
+                await token_manager.refresh_aliyun_credentials()
+                creds = await token_manager.get_aliyun_credentials()
+                transport.update_iot_token(creds.iot_token)
+                _logger.info("Aliyun IoT token refreshed via targeted credential refresh")
+                return True
+            except ReLoginRequiredError:
+                # refreshToken exhausted (2401 repeatedly) — escalate to full re-login.
+                _logger.warning("Aliyun refreshToken exhausted — escalating to full re-login")
             try:
                 await self._full_relogin(acct_session)
-                # force_refresh → _refresh_aliyun fires on_aliyun_token_refreshed which
-                # updates the transport via callback.  Explicitly push here as a safety
-                # net in case _cloud_gateway was None and _refresh_aliyun was skipped.
                 creds = await token_manager.get_aliyun_credentials()
                 transport.update_iot_token(creds.iot_token)
                 _logger.info("Aliyun IoT token refreshed after full re-login")

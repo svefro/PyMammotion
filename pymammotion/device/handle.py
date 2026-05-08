@@ -17,7 +17,13 @@ from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
 from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.command_queue import DeviceCommandQueue, Priority
 from pymammotion.proto import LubaMsg, RptAct, RptInfoType
-from pymammotion.state.device_state import DeviceAvailability, DeviceConnectionState, DeviceSnapshot, DeviceStateMachine
+from pymammotion.state.device_state import (
+    DeviceAvailability,
+    DeviceConnectionState,
+    DeviceShutdownEvent,
+    DeviceSnapshot,
+    DeviceStateMachine,
+)
 from pymammotion.transport.base import (
     BLEUnavailableError,
     EventBus,
@@ -193,6 +199,7 @@ class DeviceHandle:
         self._reducer: StateReducer = get_state_reducer(device_name)
         self._error_bus: EventBus[Exception] = EventBus()
         self._map_updated_bus: EventBus[None] = EventBus()
+        self._shutdown_bus: EventBus[DeviceShutdownEvent] = EventBus()
         self._readiness_checker: ReadinessChecker | None = readiness_checker
         self._stopping: bool = False
         self._keep_alive_task: asyncio.Task[None] | None = None
@@ -412,6 +419,16 @@ class DeviceHandle:
         # 6. Emit map_updated when the device sends a fresh area-name list.
         if luba_msg.nav is not None and luba_msg.nav.toapp_all_hash_name is not None:
             await self._map_updated_bus.emit(None)
+
+        # 7. Emit shutdown when the device notifies it is about to power off.
+        if luba_msg.sys is not None and luba_msg.sys.mow_to_app_info is not None:
+            info = luba_msg.sys.mow_to_app_info
+            if info.type == 0 and info.cmd == 0 and info.mow_data:
+                _logger.debug("Device %s is powering off (power_type=%d)", self.device_name, info.mow_data[0])
+                self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=True)
+                await self._shutdown_bus.emit(
+                    DeviceShutdownEvent(device_id=self.device_id, power_type=info.mow_data[0])
+                )
 
     async def on_status_message(self, msg: ThingStatusMessage) -> None:
         """Store status_properties on the device model from a thing/status message."""
@@ -690,6 +707,18 @@ class DeviceHandle:
 
         return self._map_updated_bus.subscribe(_wrap)
 
+    def subscribe_shutdown(
+        self,
+        handler: Callable[[DeviceShutdownEvent], Awaitable[None]],
+    ) -> Subscription:
+        """Subscribe to device shutdown events.
+
+        Fires when the device broadcasts a ``mow_to_app_info`` power-off
+        notification (``type=0, cmd=0``), giving the earliest possible signal
+        that the device is about to go offline.
+        """
+        return self._shutdown_bus.subscribe(handler)
+
     async def start(self) -> None:
         """Start the command queue processor and the MQTT activity loop.
 
@@ -950,7 +979,12 @@ class DeviceHandle:
         async def _send() -> None:
             await self.send_raw(cmd_bytes)
 
-        await self.queue.enqueue(_send, priority=Priority.BACKGROUND, skip_if_saga_active=True)
+        await self.queue.enqueue(
+            _send,
+            priority=Priority.BACKGROUND,
+            skip_if_saga_active=True,
+            dedup_key="one_shot_report",
+        )
 
     async def request_reports(self, count: int = 1, timeout: int = 10_000) -> None:
         """Enqueue a one-shot "request_iot_sys(count=count)" data refresh."""

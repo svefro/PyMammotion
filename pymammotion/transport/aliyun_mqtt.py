@@ -33,6 +33,7 @@ from pymammotion.transport.base import (
     Transport,
     TransportAvailability,
     TransportError,
+    TransportRateLimitedError,
     TransportType,
 )
 
@@ -248,6 +249,10 @@ class AliyunMQTTTransport(Transport):
 
     async def send(self, payload: bytes, iot_id: str = "") -> None:
         """Send *payload* to the device and count it against the 24-hour quota."""
+        if self.is_rate_limited:
+            remaining = self._rate_limited_until - time.monotonic()
+            msg = f"AliyunMQTTTransport rate-limited for {remaining:.0f}s more"
+            raise TransportRateLimitedError(msg)
         _logger.debug("Sending Aliyun MQTT payload: %s, %s", payload, iot_id)
         await self._invoke(payload, iot_id)
         self.record_send()

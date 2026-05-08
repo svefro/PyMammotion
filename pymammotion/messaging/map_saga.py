@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
-from pymammotion.data.model.hash_list import AreaHashNameList, HashList
+from pymammotion.data.model.hash_list import AreaHashNameList, HashList, RootHashList
 from pymammotion.data.model.region_data import RegionData
 from pymammotion.messaging.saga import Saga
 from pymammotion.transport.base import CommandTimeoutError
@@ -95,11 +95,25 @@ class MapFetchSaga(Saga):
         self.result = None
         self._reset_attempt_counter = False
 
+        # Pre-check root hash list completion so step 1 can be skipped on
+        # retry paths where only step 4 remains (saves one round-trip).
+        partial_root: RootHashList | None = None
+        root_list_complete = False
+        if not self._area_names_only:
+            partial_root = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 0), None)
+            root_list_complete = (
+                partial_root is not None
+                and partial_root.total_frame > 0
+                and len(partial_root.data) >= partial_root.total_frame
+            )
+
         # ------------------------------------------------------------------
-        # Step 1: Fetch area names (non-Luba1 only, always fresh — re-requested
-        # on every run so names stay current even after a mid-saga restart).
+        # Step 1: Fetch area names (non-Luba1 only).
+        # Skipped when root hash list already complete — we're resuming step 4
+        # and names from the first run are still valid.  Always fetched in
+        # area_names_only mode (that mode exists solely to refresh names).
         # ------------------------------------------------------------------
-        if not self._is_luba1:
+        if not self._is_luba1 and not root_list_complete:
             _logger.debug("MapFetchSaga[%s]: fetching area names", self._device_name)
             cmd = self._command_builder.get_area_name_list(self._device_id)
             try:
@@ -135,6 +149,11 @@ class MapFetchSaga(Saga):
                     len(self._get_map().area_name),
                 )
             _logger.debug("MapFetchSaga[%s]: got %d area names", self._device_name, len(self._get_map().area_name))
+        elif not self._is_luba1:
+            _logger.debug(
+                "MapFetchSaga[%s]: root hash list already complete — skipping area name re-fetch",
+                self._device_name,
+            )
 
         if self._area_names_only:
             _logger.debug("MapFetchSaga[%s]: area-names-only mode — skipping hash list fetch", self._device_name)
@@ -164,16 +183,8 @@ class MapFetchSaga(Saga):
                 hash_frame_queue.put_nowait(msg)
 
         with broker.subscribe_unsolicited(_collect_hash_frame):
-            partial_root = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 0), None)
-            root_list_complete = (
-                partial_root is not None
-                and partial_root.total_frame > 0
-                and len(partial_root.data) >= partial_root.total_frame
-            )
-
             if root_list_complete:
                 assert partial_root is not None  # noqa: S101
-                self._reset_attempt_counter = True
                 _logger.debug(
                     "MapFetchSaga[%s]: root hash list already complete (%d frame(s)) — skipping to comm data",
                     self._device_name,
@@ -225,6 +236,16 @@ class MapFetchSaga(Saga):
         # toapp_svg_msg to device.map before the saga's queue handler fires,
         # so get_map().missing_hashlist(0) reflects the up-to-date state after
         # every comm_queue.get().
+        #
+        # Protocol for each hash:
+        #   1. Send synchronize_hash_data(hash) — device starts streaming frames.
+        #   2. Ack each received frame with get_regional_data(current_frame=received)
+        #      so the device sends the next frame.
+        #   3. Once missing_frame() is empty for the received data, check whether
+        #      the whole hash is done via find_incomplete_hashes.
+        #   4. Only send synchronize_hash_data again when moving to a NEW hash —
+        #      never re-send for the hash already being streamed, or the device
+        #      restarts from frame 1.
         # ------------------------------------------------------------------
         comm_queue: asyncio.Queue[Any] = asyncio.Queue()
 
@@ -241,12 +262,13 @@ class MapFetchSaga(Saga):
             # resume — a previous run that got interrupted mid-area will have
             # added a partial FrameList to ``device.map.area[hash]``; the saga
             # must re-send ``synchronize_hash_data`` so the device re-streams
-            # the missing frames from scratch (``get_hash_response`` is only a
-            # per-frame ack, not a request-to-resume).
+            # the missing frames from scratch.
             missing_hashes = self._get_map().find_incomplete_hashes(0)
+            current_hash: int | None = None
             if missing_hashes:
-                _logger.debug("MapFetchSaga[%s]: fetching data for hash %d", self._device_name, missing_hashes[0])
-                cmd = self._command_builder.synchronize_hash_data(hash_num=missing_hashes[0])
+                current_hash = missing_hashes[0]
+                _logger.debug("MapFetchSaga[%s]: fetching data for hash %d", self._device_name, current_hash)
+                cmd = self._command_builder.synchronize_hash_data(hash_num=current_hash)
                 await self._send_command(cmd)
 
             while missing_hashes:
@@ -266,28 +288,36 @@ class MapFetchSaga(Saga):
                 current_map = self._get_map()
                 missing_frames = current_map.missing_frame(leaf_val)
                 if missing_frames:
-                    # More frames needed — request the first missing one.
-                    current_frame = leaf_val.current_frame
-                    if current_frame != missing_frames[0] - 1:
-                        current_frame = missing_frames[0] - 1
-                    region_data = self._make_region_data(leaf_name, leaf_val, current_frame)
-                    cmd = self._command_builder.get_regional_data(regional_data=region_data)
+                    # More frames needed — ack the received frame so the device sends the next.
+                    # SVG uses todev_svg_msg (sub_cmd=2); comm data uses todev_get_commondata.
+                    if leaf_name == "toapp_svg_msg":
+                        cmd = self._command_builder.send_svg_response(
+                            total_frame=leaf_val.total_frame,
+                            current_frame=leaf_val.current_frame,
+                            data_hash=leaf_val.data_hash,
+                            paternal_hash_a=leaf_val.paternal_hash_a,
+                        )
+                    else:
+                        region_data = self._make_region_data(leaf_val)
+                        cmd = self._command_builder.get_regional_data(regional_data=region_data)
                     await self._send_command(cmd)
                 else:
-                    # Hash is complete — chain to first still-incomplete hash.
+                    # This data item is complete — check whether the whole hash is done.
                     new_missing = current_map.find_incomplete_hashes(0)
                     if len(new_missing) < len(missing_hashes):
                         no_progress = 0
+                        self._reset_attempt_counter = True  # genuine map progress — refresh attempt budget
                     else:
                         no_progress += 1
                         if no_progress >= _no_progress_limit:
                             raise CommandTimeoutError("map_sync_stall", no_progress)
                     missing_hashes = new_missing
-                    if missing_hashes:
-                        _logger.debug(
-                            "MapFetchSaga[%s]: fetching data for hash %d", self._device_name, missing_hashes[0]
-                        )
-                        cmd = self._command_builder.synchronize_hash_data(hash_num=missing_hashes[0])
+                    # Only send synchronize_hash_data when moving to a new hash.
+                    # Re-sending for the current hash would restart device streaming from frame 1.
+                    if missing_hashes and missing_hashes[0] != current_hash:
+                        current_hash = missing_hashes[0]
+                        _logger.debug("MapFetchSaga[%s]: fetching data for hash %d", self._device_name, current_hash)
+                        cmd = self._command_builder.synchronize_hash_data(hash_num=current_hash)
                         await self._send_command(cmd)
 
         # If the device never returned area names and no names have been set yet,
@@ -313,17 +343,13 @@ class MapFetchSaga(Saga):
         self.result = current_map
 
     @staticmethod
-    def _make_region_data(leaf_name: str, leaf_val: Any, current_frame: int) -> RegionData:
-        """Build a RegionData request for the next missing frame."""
+    def _make_region_data(leaf_val: Any) -> RegionData:
+        """Build a RegionData ack for a received toapp_get_commondata_ack frame."""
         region_data = RegionData()
         region_data.total_frame = leaf_val.total_frame
-        region_data.current_frame = current_frame
+        region_data.current_frame = leaf_val.current_frame
         region_data.sub_cmd = leaf_val.sub_cmd
         region_data.type = leaf_val.type
-        if leaf_name == "toapp_svg_msg":
-            region_data.hash = leaf_val.data_hash
-            region_data.action = 0
-        else:
-            region_data.hash = leaf_val.hash
-            region_data.action = leaf_val.action
+        region_data.hash = leaf_val.hash
+        region_data.action = leaf_val.action
         return region_data

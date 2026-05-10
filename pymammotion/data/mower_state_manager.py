@@ -280,6 +280,12 @@ class MowerStateManager:
                         self._device.mower_state.turning_mode = settings.context
                     case 7:
                         self._device.mower_state.traversal_mode = settings.context
+                    case 10:
+                        self._device.mower_state.boundary_ride_distance = settings.context
+                    case 11:
+                        self._device.mower_state.collect_grass_enable = settings.context
+                    case 12:
+                        self._device.mower_state.animal_protection.mode = settings.context
             case "todev_unable_time_set":
                 nav_non_work_time: NavUnableTimeSet = nav_msg[1]
                 self._device.non_work_hours.non_work_sub_cmd = nav_non_work_time.sub_cmd

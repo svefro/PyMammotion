@@ -142,6 +142,22 @@ class MammotionClient:
         #: reconnect) have been exhausted and human intervention is required.
         #: HA-Luba wires this to ``entry.async_start_reauth()``.
         self.on_unrecoverable_auth_error: Callable[[Exception], Awaitable[None]] | None = None
+        #: Fired (async) whenever any credential type is successfully refreshed.
+        #: Integrations can wire this to persist the updated token cache.
+        self._on_credentials_updated: Callable[[], Awaitable[None]] | None = None
+
+    @property
+    def on_credentials_updated(self) -> Callable[[], Awaitable[None]] | None:
+        """Callback fired after any successful credential refresh."""
+        return self._on_credentials_updated
+
+    @on_credentials_updated.setter
+    def on_credentials_updated(self, value: Callable[[], Awaitable[None]] | None) -> None:
+        self._on_credentials_updated = value
+        # Forward to token_manager if it is already initialised.
+        tm = self.token_manager
+        if tm is not None:
+            tm.on_credentials_updated = value
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -935,6 +951,7 @@ class MammotionClient:
 
             acct_session.cloud_client = cloud_client
             acct_session.token_manager = TokenManager(account, mammotion_http, cloud_client)
+            acct_session.token_manager.on_credentials_updated = self._on_credentials_updated
             al_transport = self._setup_aliyun_transport(cloud_client, acct_session)
             acct_session.aliyun_transport = al_transport
             ua = acct_session.user_account
@@ -959,6 +976,7 @@ class MammotionClient:
             else:
                 if acct_session.token_manager is None:
                     acct_session.token_manager = TokenManager(account, mammotion_http)
+                    acct_session.token_manager.on_credentials_updated = self._on_credentials_updated
                 transport = self._setup_mammotion_transport(
                     mammotion_http.mqtt_credentials, mammotion_http, acct_session, acct_session.token_manager
                 )
@@ -1319,7 +1337,7 @@ class MammotionClient:
         acct_session.cloud_client = cloud_client
         acct_session.user_account = self._extract_user_account(cloud_client.mammotion_http)
         acct_session.token_manager = TokenManager(account, cloud_client.mammotion_http, cloud_client)
-
+        acct_session.token_manager.on_credentials_updated = self._on_credentials_updated
         transport = self._setup_aliyun_transport(cloud_client, acct_session)
         acct_session.aliyun_transport = transport
 
@@ -1428,6 +1446,7 @@ class MammotionClient:
             mammotion_http.mqtt_credentials = mqtt_creds
             if acct_session.token_manager is None:
                 acct_session.token_manager = TokenManager(account, mammotion_http)
+                acct_session.token_manager.on_credentials_updated = self._on_credentials_updated
             transport = self._setup_mammotion_transport(
                 mqtt_creds, mammotion_http, acct_session, acct_session.token_manager
             )
@@ -1615,6 +1634,38 @@ class MammotionClient:
 
         saga = PlanFetchSaga(command_builder=commands, send_command=_send)
         await handle.enqueue_saga(saga)
+
+    async def check_and_get_mow_path(self, device_name: str) -> None:
+        if handle := self._device_registry.get_by_name(device_name):
+            device = cast(MowerDevice, handle.snapshot.raw)
+            work = device.report_data.work
+            # path_hash in (0, 1) means "no job" / "job ended".
+            has_active_job = work.ub_path_hash != 0 or work.path_hash not in (0, 1)
+            if not has_active_job:
+                return
+            if device.map.current_mow_path:
+                # Cache exists — validate it against the current active segment hash.
+                # ub_path_hash appears directly as path_packets[0].path_hash inside the
+                # cover-path frames (confirmed via APK HashDataManager and device data).
+                # If ub_path_hash is 0 we can't validate a specific segment, so keep.
+                if work.ub_path_hash == 0 or device.map.has_mow_path_for_hash(work.ub_path_hash):
+                    return  # Cache is valid for the current job segment
+                # Cache exists but doesn't contain the current segment — stale.
+                # Clear it so the saga fetches fresh data below.
+                device.map.invalidate_mow_path(0)
+            if handle.queue.is_saga_active:
+                return
+            _logger.debug(
+                "Device %s path_hash=%d ub_path_hash=%d — auto-fetching cover path",
+                device_name,
+                work.path_hash,
+                work.ub_path_hash,
+            )
+            try:
+                current_work = GenerateRouteInformation.from_current_task_settings(device.work)
+                await self.start_mow_path_saga(device_name, zone_hashs=[], route_info=current_work, skip_planning=True)
+            except Exception:  # noqa: BLE001
+                _logger.warning("Auto-trigger MowPathSaga failed for %s", device_name, exc_info=True)
 
     async def start_mow_path_saga(
         self,

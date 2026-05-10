@@ -439,14 +439,14 @@ async def test_ble_sync_sent_before_payload_after_5_minute_idle() -> None:
 
 
 async def test_no_ble_sync_when_recently_active() -> None:
-    """_send_marked must NOT prepend a sync when the last command was < 5 minutes ago."""
+    """_send_marked must NOT prepend a sync when the last command was within the 50 s threshold."""
     import time
 
     mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     handle = _make_handle(mqtt_transport=mqtt_transport)
 
-    # Seed the transport's last_send_monotonic to simulate 2 minutes of inactivity (under threshold)
-    mqtt_transport.last_send_monotonic = time.monotonic() - 120
+    # Seed the transport's last_send_monotonic to simulate 30 s of inactivity (under 50 s threshold)
+    mqtt_transport.last_send_monotonic = time.monotonic() - 30
 
     sent: list[bytes] = []
 

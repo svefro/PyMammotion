@@ -128,13 +128,13 @@ class MessageSystem(AbstractMessage, ABC):
     def read_and_set_sidelight(self, is_sidelight: bool, operate: int) -> bytes:
         """Read or set the side LED.
 
-        is_sidelight=True  → enable=1 (light on)
-        is_sidelight=False → enable=0 (light off)
+        is_sidelight=True  → enable=0 (light on)
+        is_sidelight=False → enable=1 (light off)
         operate=0 → write (set), operate=1 → read (query current state).
         """
         build = TimeCtrlLight(
             operate=operate,
-            enable=1 if is_sidelight else 0,
+            enable=0 if is_sidelight else 1,
             action=0,
             start_hour=0,
             start_min=0,

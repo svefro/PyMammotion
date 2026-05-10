@@ -13,7 +13,7 @@ from pymammotion.transport import AuthError
 from pymammotion.transport.base import ReLoginRequiredError, TransportType
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from pymammotion.aliyun.cloud_gateway import CloudIOTGateway
     from pymammotion.device.handle import DeviceHandle
@@ -111,6 +111,9 @@ class TokenManager:
         # Called with the fresh iotToken whenever _aliyun_creds is updated, so the
         # AliyunMQTTTransport's bind token stays current without waiting for a bind failure.
         self.on_aliyun_token_refreshed: Callable[[str], None] | None = None
+        #: Fired (async) after any credential type is successfully refreshed.
+        #: Integrations can wire this to persist the updated token cache.
+        self.on_credentials_updated: Callable[[], Awaitable[None]] | None = None
         # Monotonic timestamps of recent 2401 "refreshToken invalid" failures.
         # Three failures within _ALIYUN_FAILURE_WINDOW seconds → ReLoginRequiredError.
         self._aliyun_refresh_failures: list[float] = []
@@ -319,6 +322,11 @@ class TokenManager:
             raise
         except Exception as exc:
             raise ReLoginRequiredError(self._account_id, str(exc)) from exc
+        if self.on_credentials_updated is not None:
+            try:
+                await self.on_credentials_updated()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _refresh_aliyun(self) -> None:
         """Refresh the Aliyun IoT session via check_or_refresh_session().
@@ -378,6 +386,11 @@ class TokenManager:
             raise ReLoginRequiredError(self._account_id, str(exc)) from exc
         except Exception as exc:
             raise ReLoginRequiredError(self._account_id, str(exc)) from exc
+        if self.on_credentials_updated is not None:
+            try:
+                await self.on_credentials_updated()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     async def connect_iot(cloud_client: CloudIOTGateway) -> None:
@@ -481,6 +494,11 @@ class TokenManager:
                     raise ReLoginRequiredError(self._account_id, str(exc)) from exc
         except Exception as exc:
             raise ReLoginRequiredError(self._account_id, str(exc)) from exc
+        if self.on_credentials_updated is not None:
+            try:
+                await self.on_credentials_updated()
+            except Exception:  # noqa: BLE001
+                pass
         return self._mqtt_creds
 
     @property

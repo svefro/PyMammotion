@@ -371,6 +371,10 @@ class MowerStateReducer(StateReducer):
                         device.mower_state.collect_grass_enable = settings.context
                     case 12:
                         device.mower_state.animal_protection.mode = settings.context
+                        if settings.context in (1, 2):
+                            device.mower_state.animal_protection.status = 1
+                        else:
+                            device.mower_state.animal_protection.status = 0
                     case 13:
                         device.mower_state.animal_protection.status = settings.context
             case "todev_unable_time_set":

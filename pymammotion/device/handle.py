@@ -281,6 +281,9 @@ class DeviceHandle:
             self.update_availability(transport_type, state)
             if transport_type == TransportType.BLE:
                 if state == TransportAvailability.CONNECTED:
+                    # BLE arriving while MQTT is reconnecting provides a fallback send path —
+                    # open the queue gate so commands can flow immediately over BLE.
+                    self.queue.resume_after_reconnect()
                     asyncio.get_running_loop().create_task(self._on_ble_connected())
                 else:
                     # Wake the MQTT loop immediately so it resumes heartbeating
@@ -294,6 +297,23 @@ class DeviceHandle:
                         if task is not None and not task.done():
                             task.cancel()
                         self._ble_stream_active = False
+            elif state == TransportAvailability.CONNECTING:
+                # MQTT subscription is not yet active — commands sent now would time
+                # out waiting for a response.  Gate the queue unless BLE is connected
+                # and can serve as the send path instead.
+                ble = self._transports.get(TransportType.BLE)
+                if ble is None or not ble.is_connected:
+                    _logger.debug(
+                        "DeviceHandle[%s]: MQTT transport reconnecting — pausing command dispatch",
+                        self.device_name,
+                    )
+                    self.queue.pause_for_reconnect()
+            else:
+                # CONNECTED or DISCONNECTED — open the gate.
+                # CONNECTED: subscription is live, commands can be dispatched normally.
+                # DISCONNECTED: don't hold commands indefinitely; let NoTransportAvailableError
+                # handle them if no other transport is available.
+                self.queue.resume_after_reconnect()
 
         return _handler
 
@@ -336,8 +356,9 @@ class DeviceHandle:
             )
 
         last = transport.last_send_monotonic
-        if last != 0.0 and time.monotonic() - last > 300:
-            # No commands sent for 5 minutes — prepend a BLE sync so the
+        # this will always be BLE as ble constantly pings 20s ble sync messages
+        if last != 0.0 and time.monotonic() - last > 50:
+            # No commands sent for 50 seconds — prepend a BLE sync so the
             # device knows we are still connected before the real payload.
             sync = self.commands.send_todev_ble_sync(sync_type=3)
             await transport.send(sync, iot_id=self.iot_id)

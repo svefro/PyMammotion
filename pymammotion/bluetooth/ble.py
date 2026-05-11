@@ -36,18 +36,24 @@ class MammotionBLE:
             return await self.create_client(device)
         return False
 
-    async def create_client(self, device: BLEDevice):
+    async def create_client(self, device: BLEDevice) -> bool:
         """Create a BleakClient for the given BLE device and connect to it."""
         self.client = BleakClient(device.address)
         return await self.connect()
 
     async def connect(self) -> bool:
         """Connect the BLE client, returning False if no client has been created."""
-        return await self.client.connect() if self.client is not None else False
+        if client := self.client:
+            await client.connect()
+            return client.is_connected
+        return False
 
     async def disconnect(self) -> bool:
         """Disconnect the BLE client, returning False if no client has been created."""
-        return await self.client.disconnect() if self.client is not None else False
+        if client := self.client:
+            await client.disconnect()
+            return client.is_connected
+        return False
 
     async def notification_handler(self, _characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         """Simple notification handler which prints the data received."""
@@ -66,6 +72,6 @@ class MammotionBLE:
             await self.client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self.notification_handler)
             await self.client.start_notify(SERVICE_CHANGED_CHARACTERISTIC, self.service_changed_handler)
 
-    def get_client(self):
+    def get_client(self) -> BleakClient:
         """Returns the ble client."""
         return self.client

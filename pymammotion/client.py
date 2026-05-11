@@ -2063,6 +2063,7 @@ class MammotionClient:
         expected_field: str,
         *,
         send_timeout: float = 5.0,
+        prefer_ble: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Send a command and wait for the matching protobuf response.
@@ -2080,6 +2081,7 @@ class MammotionClient:
         Raises:
             KeyError:             if *name* is not a registered device.
             CommandTimeoutError:  if no response after retries.
+            :param prefer_ble:
 
         """
         handle = self._device_registry.get_by_name(name)
@@ -2093,7 +2095,7 @@ class MammotionClient:
 
         async def _send() -> None:
             await self._send_with_auth_retry(
-                lambda: handle.send_raw(payload=command_bytes),
+                lambda: handle.send_raw(payload=command_bytes, prefer_ble=prefer_ble),
                 _session,
             )
 

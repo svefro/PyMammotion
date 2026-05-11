@@ -357,6 +357,7 @@ class BLETransport(Transport):
             await self._client.disconnect()
         self._client = None
         self._message = None
+        self.clear_ble_device()
         await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def _write_payload(self, payload: bytes) -> None:

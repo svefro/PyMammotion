@@ -7,6 +7,7 @@ import contextlib
 from dataclasses import dataclass, field
 from enum import IntEnum
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, TooManyRequestsException
@@ -31,6 +32,11 @@ class Priority(IntEnum):
     BACKGROUND = 3  # low-urgency polling — waits for exclusive slot
 
 
+#: Commands that have not been dispatched within this window are silently dropped.
+#: EMERGENCY items (e-stop, return-to-dock) are exempt.
+_COMMAND_TTL = 120.0  # 2 minutes
+
+
 @dataclass(order=True)
 class _QueueItem:
     priority: int
@@ -38,6 +44,7 @@ class _QueueItem:
     work: Callable[[], Awaitable[None]] = field(compare=False)
     skip_if_saga_active: bool = field(compare=False, default=False)
     dedup_key: str | None = field(compare=False, default=None)
+    enqueued_at: float = field(compare=False, default_factory=time.monotonic)
 
 
 class DeviceCommandQueue:
@@ -218,6 +225,20 @@ class DeviceCommandQueue:
                 # Release dedup slot as soon as item is dequeued
                 if item.dedup_key is not None:
                     self._pending_dedup_keys.discard(item.dedup_key)
+
+                # Drop commands that have waited longer than _COMMAND_TTL without being
+                # dispatched.  Checked here — before any lock/gate waits — so stale
+                # commands don't execute after a long reconnect or saga pause.
+                # EMERGENCY items (e-stop, return-to-dock) are exempt.
+                if item.priority > Priority.EMERGENCY:
+                    age = time.monotonic() - item.enqueued_at
+                    if age > _COMMAND_TTL:
+                        _logger.debug(
+                            "DeviceCommandQueue[%s]: command expired after %.0fs — dropping",
+                            self._device_name,
+                            age,
+                        )
+                        continue
 
                 # Non-emergency items yield to an active exclusive op
                 if item.priority > Priority.EXCLUSIVE:

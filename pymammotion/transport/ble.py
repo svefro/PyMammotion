@@ -266,7 +266,21 @@ class BLETransport(Transport):
             # [org.bluez.Error.NotPermitted] Notify acquired.
             with contextlib.suppress(Exception):
                 await self._client.stop_notify(UUID_NOTIFICATION_CHARACTERISTIC)
-            await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
+            try:
+                await self._client.start_notify(UUID_NOTIFICATION_CHARACTERISTIC, self._notification_handler)
+            except BleakError as exc:
+                if "Notify acquired" in str(exc):
+                    # BlueZ reports the channel is already open — our previous
+                    # connection's subscription is still live.  Notifications will
+                    # continue to arrive, so there is nothing to do here.
+                    _logger.debug(
+                        "BLETransport: notify already acquired for %s — reusing existing subscription",
+                        self._config.device_id,
+                    )
+                else:
+                    await self._notify_availability(TransportAvailability.DISCONNECTED)
+                    self._record_connect_failure()
+                    raise BLEUnavailableError(f"BLE start_notify failed for {self._config.device_id!r}: {exc}") from exc
             await self._notify_availability(TransportAvailability.CONNECTED)
             _logger.debug("BLETransport connected to %s", self._config.device_id)
 

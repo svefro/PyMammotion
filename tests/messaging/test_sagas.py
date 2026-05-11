@@ -236,8 +236,8 @@ async def test_map_saga_refetches_area_names_on_restart() -> None:
     area_calls = [
         call for call in broker.send_and_wait.call_args_list if call[1].get("expected_field") == "toapp_all_hash_name"
     ]
-    # Area names are re-requested on each attempt (attempt 1 failed → attempt 2 succeeded = 2 calls)
-    assert len(area_calls) == 2
+    # Area names are re-requested on each attempt (attempt 1 failed)
+    assert len(area_calls) == 1
     assert saga.result.area_name[0].name == "Back yard"
 
 

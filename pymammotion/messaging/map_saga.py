@@ -47,8 +47,8 @@ class MapFetchSaga(Saga):
     """
 
     name = "map_fetch"
-    max_attempts = 3
-    step_timeout = 3.0  # map fetch steps can be slow
+    max_attempts = 2
+    step_timeout = 1.0  # map fetch steps can be slow
 
     def __init__(
         self,
@@ -99,6 +99,10 @@ class MapFetchSaga(Saga):
         # retry paths where only step 4 remains (saves one round-trip).
         partial_root: RootHashList | None = None
         root_list_complete = False
+
+        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+        await self._send_command(cmd)
+
         if not self._area_names_only:
             partial_root = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 0), None)
             root_list_complete = (
@@ -123,8 +127,6 @@ class MapFetchSaga(Saga):
                     send_timeout=self.step_timeout,
                 )
             except CommandTimeoutError:
-                cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
-                await self._send_command(cmd)
                 raise
 
             _area_frame = self.extract_nav_frame(response, "toapp_all_hash_name")
@@ -201,14 +203,10 @@ class MapFetchSaga(Saga):
                     try:
                         response = await asyncio.wait_for(hash_frame_queue.get(), timeout=self.step_timeout)
                     except TimeoutError:
-                        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
-                        await self._send_command(cmd)
                         raise CommandTimeoutError("toapp_gethash_ack", 1) from None
 
                     _hash_frame = self.extract_nav_frame(response, "toapp_gethash_ack")
                     if _hash_frame is None:
-                        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
-                        await self._send_command(cmd)
                         raise CommandTimeoutError("toapp_gethash_ack", 1)
                     hash_ack = _hash_frame[1]
 
@@ -275,8 +273,6 @@ class MapFetchSaga(Saga):
                 try:
                     response = await asyncio.wait_for(comm_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
-                    cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
-                    await self._send_command(cmd)
                     raise CommandTimeoutError("toapp_get_commondata_ack", 1) from None
 
                 # State reducer has already applied this frame to device.map.

@@ -44,8 +44,8 @@ class MowPathSaga(Saga):
     """
 
     name = "mow_path_fetch"
-    max_attempts = 3
-    step_timeout = 3.0
+    max_attempts = 1
+    step_timeout = 1.0
 
     def __init__(
         self,
@@ -92,6 +92,10 @@ class MowPathSaga(Saga):
         self.result = {}
         self._get_map().current_mow_path = {}
 
+        # start with ble sync
+        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+        await self._send_command(cmd)
+
         # ------------------------------------------------------------------
         # Step 1: Request the line hash list (sub_cmd=3), collect all frames,
         # send get_hash_response acks for each.
@@ -114,8 +118,6 @@ class MowPathSaga(Saga):
                 try:
                     ack_response = await asyncio.wait_for(hash_ack_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
-                    cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
-                    await self._send_command(cmd)
                     if _total_frame == 0:
                         _logger.warning(
                             "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)",

@@ -547,7 +547,7 @@ class HashList(DataClassORJSONMixin):
     def update(self, hash_data: NavGetCommData | SvgMessage) -> bool:
         """Route *hash_data* into the appropriate per-type dict and return whether it was new.
 
-        AREA frames also auto-assign an ``area_name`` ("area N") if none exists
+        AREA frames also auto-assign an ``area_name`` ("Area N") if none exists
         for the hash yet.  DYNAMICS_LINE (type 18) is keyed by frame order and
         resets on ``current_frame == 1``.
         """
@@ -557,12 +557,12 @@ class HashList(DataClassORJSONMixin):
                 used_numbers = {
                     int(a.name.split()[-1])
                     for a in self.area_name
-                    if a.name.startswith("area ") and a.name.split()[-1].isdigit()
+                    if a.name.startswith("Area ") and a.name.split()[-1].isdigit()
                 }
                 n = 1
                 while n in used_numbers:
                     n += 1
-                self.area_name.append(AreaHashNameList(name=f"area {n}", hash=hash_data.hash))
+                self.area_name.append(AreaHashNameList(name=f"Area {n}", hash=hash_data.hash))
             result = self._add_hash_data(self.area, hash_data)
             self.update_hash_lists(self.hashlist)
             return result
@@ -772,16 +772,32 @@ class HashList(DataClassORJSONMixin):
         return ub_path_hash not in self.line
 
     def geojson_needs_regeneration(self, rtk: LocationPoint, yaw_threshold: float = 0.01) -> bool:
-        """Return True if the stored GeoJSON was built with a different RTK yaw.
+        """Return True if the stored GeoJSON is absent, has a stale RTK yaw, or has stale map hashes.
 
         A difference larger than *yaw_threshold* radians (~0.6°) means the
         coordinate rotation used at generation time no longer matches the
         current RTK heading, so the GeoJSON should be regenerated.
-        Callers should also regenerate when ``generated_geojson`` is empty.
+
+        Hash staleness is detected by comparing the hashes present in the
+        GeoJSON features against the device's current ``area_root_hashlist``
+        (sub_cmd=0 entries only; sub_cmd=3 breakpoint lines are never rendered
+        in the GeoJSON).  Any feature hash absent from the root list means the
+        GeoJSON was built from data that has since been deleted on the device.
         """
         if not self.generated_geojson:
             return True
-        return abs(rtk.yaw - self.geojson_yaw) > yaw_threshold
+        if abs(rtk.yaw - self.geojson_yaw) > yaw_threshold:
+            return True
+        current_hashlist = set(self.area_root_hashlist)
+        if current_hashlist:
+            geojson_hashes = {
+                f["properties"]["hash"]
+                for f in self.generated_geojson.get("features", [])
+                if isinstance(f.get("properties"), dict) and f["properties"].get("hash") is not None
+            }
+            if geojson_hashes - current_hashlist:
+                return True
+        return False
 
     def generate_geojson(self, rtk: LocationPoint, dock: Dock) -> Any:
         """Rebuild ``generated_geojson`` from the cached frames."""

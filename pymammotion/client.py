@@ -1597,6 +1597,7 @@ class MammotionClient:
                     _logger.debug(f"Restoring root_hash_lists for {device.map} from saga result")
                     _logger.debug(f"Restoring root_hash_lists for {saga.result} from saga result")
                     device.map.root_hash_lists = saga.result.root_hash_lists
+                device.map.update_hash_lists(device.map.hashlist)
                 if device.location.RTK.latitude != 0:
                     device.map.generate_geojson(device.location.RTK, device.location.dock)
                 # Notify map_updated subscribers after a successful saga, matching

@@ -230,7 +230,6 @@ class DeviceHandle:
         self._last_report_at: float = 0.0
         #: Timer handle for the transient continuous-stream auto-stop.
         self._report_stream_timer: asyncio.TimerHandle | None = None
-
         # Wire up critical error propagation from queue
         self.queue.on_critical_error = self._on_critical_error
 
@@ -462,6 +461,10 @@ class DeviceHandle:
         so that the state reducer and broker can process it (same path as a
         ``thing/model/down_raw`` delivery).  All other event types are stored
         as ``device_event`` on the device model.
+
+        Staleness filtering (dropping buffered messages older than the wall
+        clock) is handled upstream in ``AliyunMQTTTransport._dispatch_aliyun_event``
+        where the raw envelope timestamp is available before deserialization.
         """
         if isinstance(event.params, DeviceProtobufMsgEventParams):
             try:

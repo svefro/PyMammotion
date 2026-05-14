@@ -2,8 +2,8 @@ version = 1
 revision = 3
 requires-python = ">=3.14, <4.0"
 resolution-markers = [
-    "python_full_version >= '3.15'",
-    "python_full_version < '3.15'",
+    "python_full_version >= '3.14'",
+    "python_full_version < '3.14'",
 ]
 
 [[package]]
@@ -1656,7 +1656,7 @@ wheels = [
 
 [[package]]
 name = "pymammotion"
-version = "0.7.110"
+version = "0.7.111"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

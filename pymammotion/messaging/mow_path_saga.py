@@ -135,7 +135,6 @@ class MowPathSaga(Saga):
                 ack = ack_response.nav.toapp_gethash_ack
                 _current_frame = ack.current_frame
                 _total_frame = ack.total_frame
-                self._reset_attempt_counter = True
                 _logger.debug("MowPathSaga: line hash frame %d/%d", _current_frame, _total_frame)
 
                 # Acknowledge every frame, including the last one.
@@ -145,6 +144,8 @@ class MowPathSaga(Saga):
                 await self._send_command(ack_cmd)
 
                 if ack.current_frame == ack.total_frame:
+                    # Step 1 fully complete — earned a fresh attempt budget for the rest of the saga.
+                    self._reset_attempt_counter = True
                     break
 
         # ------------------------------------------------------------------
@@ -214,6 +215,11 @@ class MowPathSaga(Saga):
 
         current_run_tx_ids: set[int] = set()
 
+        _NO_PROGRESS_LIMIT = 10
+
+        def _missing_frame_count() -> int:
+            return sum(len(v) for v in self._get_map().find_missing_mow_path_frames().values())
+
         with broker.subscribe_unsolicited(_collect_path):
             for batch_idx, batch_hashes in enumerate(hash_batches):
                 transaction_id = int(time.time() * 1000)
@@ -228,13 +234,19 @@ class MowPathSaga(Saga):
                 cmd = self._command_builder.get_line_info_list(batch_hashes, transaction_id)
                 await self._send_command(cmd)
 
+                # Track missing-frame count to detect "frames are arriving but not advancing us"
+                # (duplicates, stale tx, etc.).  Counter resets at the start of each batch so
+                # the first frame of a new batch (which inflates missing as the tx is created)
+                # is never the one that trips the guard.
+                prev_missing = _missing_frame_count()
+                no_progress = 0
+
                 while True:
                     try:
                         frame_response = await asyncio.wait_for(path_queue.get(), timeout=self.step_timeout)
                     except TimeoutError:
                         raise CommandTimeoutError("cover_path_upload", 1) from None
 
-                    self._reset_attempt_counter = True
                     _, path_val = betterproto2.which_one_of(frame_response.nav, "SubNavMsg")
                     mow_path = MowPath.from_dict(path_val.to_dict(casing=betterproto2.Casing.SNAKE))
 
@@ -255,6 +267,18 @@ class MowPathSaga(Saga):
                         batch_idx + 1,
                         len(hash_batches),
                     )
+
+                    new_missing = _missing_frame_count()
+                    if new_missing < prev_missing:
+                        no_progress = 0
+                        # Genuine forward progress — refresh the attempt budget so a long
+                        # multi-batch fetch isn't penalised for an earlier interruption.
+                        self._reset_attempt_counter = True
+                    else:
+                        no_progress += 1
+                        if no_progress >= _NO_PROGRESS_LIMIT:
+                            raise CommandTimeoutError("mow_path_stall", no_progress)
+                    prev_missing = new_missing
 
                     if not self._get_map().find_missing_mow_path_frames():
                         break

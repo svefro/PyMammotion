@@ -192,6 +192,12 @@ class DeviceHandle:
         self._properties_bus: EventBus[ThingPropertiesMessage] = EventBus()
         self._event_bus: EventBus[ThingEventMessage] = EventBus()
         self._prefer_ble: bool = prefer_ble
+        # MQTT-only saga gates. When False AND the saga would run over MQTT
+        # (no actively-connected BLE), the saga is suppressed (mow path) or
+        # downgraded to area-names-only (map). Bypassed entirely while BLE
+        # is connected — local link, no cloud quota concern.
+        self._mow_path_fetch_enabled: bool = True
+        self._full_map_fetch_enabled: bool = True
         # Pick a reducer matching the device kind. PoolCleanerDevice instances
         # get a PoolStateReducer (currently a stub); everything else gets the
         # full mower reducer. Decided once at construction so the per-message
@@ -1237,6 +1243,30 @@ class DeviceHandle:
     def set_prefer_ble(self, *, value: bool) -> None:
         """Change the transport preference at runtime (e.g. when BLE connects/disconnects)."""
         self._prefer_ble = value
+
+    @property
+    def mow_path_fetch_enabled(self) -> bool:
+        """When False, MowPathSaga is suppressed for sends that would go over MQTT.
+
+        BLE-routed mow path fetches always run regardless — local link, no cloud cost.
+        """
+        return self._mow_path_fetch_enabled
+
+    def set_mow_path_fetch_enabled(self, *, value: bool) -> None:
+        """Toggle the MQTT-side mow path fetch gate at runtime."""
+        self._mow_path_fetch_enabled = value
+
+    @property
+    def full_map_fetch_enabled(self) -> bool:
+        """When False, MapFetchSaga over MQTT runs in area-names-only mode.
+
+        BLE-routed map fetches always run the full sync regardless.
+        """
+        return self._full_map_fetch_enabled
+
+    def set_full_map_fetch_enabled(self, *, value: bool) -> None:
+        """Toggle the MQTT-side full map fetch gate at runtime (False ⇒ names-only)."""
+        self._full_map_fetch_enabled = value
 
     @property
     def ble_stream_active(self) -> bool:

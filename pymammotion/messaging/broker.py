@@ -108,7 +108,16 @@ class DeviceMessageBroker:
                     # shield prevents the future being cancelled on timeout;
                     # a late response can still resolve it on retry
                     return await asyncio.wait_for(asyncio.shield(future), timeout=send_timeout)
-                except TimeoutError:
+                except (TimeoutError, asyncio.CancelledError) as exc:
+                    # TimeoutError: normal per-attempt timeout.
+                    # CancelledError: in Python 3.12+, asyncio.shield can cause the
+                    # timeout scope's cancellation marker to be lost, so wait_for
+                    # raises CancelledError instead of TimeoutError. Clear the
+                    # pending-cancellation counter so asyncio accounting stays correct.
+                    if isinstance(exc, asyncio.CancelledError):
+                        task = asyncio.current_task()
+                        if task is not None:
+                            task.uncancel()
                     if attempt < retries:
                         _logger.debug(
                             "No response for '%s' (attempt %d/%d), retrying",

@@ -523,8 +523,7 @@ class TokenManager:
             except Exception:  # noqa: BLE001
                 pass
         if self._mqtt_creds is None:
-            msg = "MQTT credentials not set after refresh"
-            raise AuthError(msg)
+            raise ReLoginRequiredError(self._account_id, "MQTT credentials unavailable")
         return self._mqtt_creds
 
     @property

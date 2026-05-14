@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import betterproto2
 
+from pymammotion.aliyun.exceptions import GatewayTimeoutException
 from pymammotion.transport.base import CommandTimeoutError, SagaFailedError, SagaInterruptedError
 
 if TYPE_CHECKING:
@@ -99,14 +100,22 @@ class Saga(ABC):
             raise SagaFailedError(self.name, self.max_attempts) from None
 
     async def _retry_loop(self, broker: DeviceMessageBroker) -> None:
-        """Inner retry loop — runs until success or max_attempts exhausted."""
+        """Inner retry loop — runs until success or max_attempts exhausted.
+
+        ``GatewayTimeoutException`` is handled here as an interruption rather than
+        propagated.  If we let it escape, ``DeviceCommandQueue._process`` would
+        catch it and replay the entire saga work-item up to 3× — multiplying
+        every cloud invoke the saga has already made.  The saga subclasses know
+        how to resume from device state, so it's strictly cheaper to let our own
+        retry/resume logic handle it.
+        """
         attempt = 0
         while True:
             attempt += 1
             self._reset_attempt_counter = False
             try:
                 await self._run(broker)
-            except (SagaInterruptedError, CommandTimeoutError) as exc:
+            except (SagaInterruptedError, CommandTimeoutError, GatewayTimeoutException) as exc:
                 if self._reset_attempt_counter:
                     # The subclass successfully resumed from a partial frame — give it a
                     # fresh set of attempts so the resumed run is not penalised for the

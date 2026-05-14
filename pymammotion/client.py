@@ -348,7 +348,7 @@ class MammotionClient:
         if handle := self._device_registry.get_by_name(device_name):
             await handle.request_report_snapshot()
 
-    async def request_reports(self, device_name: str, *, count: int = 1, timeout: int = 10000) -> None:
+    async def request_reports(self, device_name: str, *, count: int = 1, timeout: int = 1000) -> None:
         """Fire a one-shot count=count report, skipped if the BLE stream is already active."""
         if handle := self._device_registry.get_by_name(device_name):
             await handle.request_reports(count=count, timeout=timeout)
@@ -1574,15 +1574,27 @@ class MammotionClient:
 
         if handle := self._device_registry.get_by_name(device_name):
             commands = handle.commands
-            transport = handle.active_transport()
-            _iot_id = handle.iot_id
+            # MQTT-only gate: when full_map_fetch_enabled is False AND BLE isn't
+            # actively connected (so this would go over MQTT), downgrade to
+            # area-names-only mode.  BLE-routed syncs always run the full fetch.
+            mqtt_only_run = not handle.is_transport_connected(TransportType.BLE)
+            area_names_only = mqtt_only_run and not handle.full_map_fetch_enabled
+            existing_area_hashes: list[int] | None = None
+            if area_names_only:
+                existing_area_hashes = sorted(cast(MowerDevice, handle.snapshot.raw).map.area.keys())
+                _logger.debug(
+                    "start_map_sync '%s': full_map_fetch_enabled=False over MQTT — area-names-only mode",
+                    device_name,
+                )
             saga = MapFetchSaga(
                 device_id=handle.device_id,
                 device_name=handle.device_name,
                 is_luba1=DeviceType.is_luba1(device_name),
                 command_builder=commands,
-                send_command=lambda cmd: transport.send(cmd, iot_id=_iot_id),
+                send_command=handle.send_raw,
                 get_map=lambda: cast(MowerDevice, handle.snapshot.raw).map,
+                area_names_only=area_names_only,
+                existing_area_hashes=existing_area_hashes,
             )
 
             async def _on_map_complete() -> None:
@@ -1628,13 +1640,7 @@ class MammotionClient:
         if handle is None:
             _logger.warning("start_plan_sync: device '%s' not registered", device_name)
             return
-        commands = handle.commands
-        _iot_id = handle.iot_id
-
-        async def _send(cmd: bytes) -> None:
-            await handle.active_transport().send(cmd, iot_id=_iot_id)
-
-        saga = PlanFetchSaga(command_builder=commands, send_command=_send)
+        saga = PlanFetchSaga(command_builder=handle.commands, send_command=handle.send_raw)
         await handle.enqueue_saga(saga)
 
     async def check_and_get_mow_path(self, device_name: str) -> None:
@@ -1691,15 +1697,18 @@ class MammotionClient:
         from pymammotion.messaging.mow_path_saga import MowPathSaga
 
         if handle := self._device_registry.get_by_name(device_name):
-            commands = handle.commands
-            _iot_id = handle.iot_id
-
-            async def _send(cmd: bytes) -> None:
-                await handle.active_transport().send(cmd, iot_id=_iot_id)
-
+            # MQTT-only gate: skip when mow_path_fetch_enabled is False AND BLE
+            # isn't actively connected (so this would go over MQTT).  BLE-routed
+            # fetches always run.
+            if not handle.mow_path_fetch_enabled and not handle.is_transport_connected(TransportType.BLE):
+                _logger.debug(
+                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False over MQTT — skipping",
+                    device_name,
+                )
+                return
             saga = MowPathSaga(
-                command_builder=commands,
-                send_command=_send,
+                command_builder=handle.commands,
+                send_command=handle.send_raw,
                 get_map=lambda: handle.snapshot.raw.map,
                 zone_hashs=zone_hashs,
                 route_info=route_info,
@@ -1740,14 +1749,9 @@ class MammotionClient:
             _logger.warning("get_dynamics_line: device '%s' not registered", device_name)
             return
 
-        _iot_id = handle.iot_id
-
-        async def _send(cmd: bytes) -> None:
-            await handle.active_transport().send(cmd, iot_id=_iot_id)
-
         saga = CommonDataSaga(
             command_builder=handle.commands,
-            send_command=_send,
+            send_command=handle.send_raw,
             action=8,
             type=PathType.DYNAMICS_LINE,
         )
@@ -1784,13 +1788,7 @@ class MammotionClient:
         if handle is None:
             _logger.warning("start_edge_mapping: device '%s' not registered", device_name)
             return
-        commands = handle.commands
-        _iot_id = handle.iot_id
-
-        async def _send(cmd: bytes) -> None:
-            await handle.active_transport().send(cmd, iot_id=_iot_id)
-
-        saga = EdgeMappingSaga(command_builder=commands, send_command=_send, skip_start=skip_start)
+        saga = EdgeMappingSaga(command_builder=handle.commands, send_command=handle.send_raw, skip_start=skip_start)
         await handle.enqueue_saga(saga)
 
     # ------------------------------------------------------------------
@@ -2136,6 +2134,28 @@ class MammotionClient:
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_prefer_ble(value=prefer_ble)
+
+    def set_mow_path_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
+        """Toggle the MQTT-side mow path fetch gate for a registered device.
+
+        When False, MowPathSaga is skipped (auto-trigger and explicit
+        ``start_mow_path_saga``) for any send that would go over MQTT.  BLE
+        sends always run regardless — local link, no cloud quota concern.
+        """
+        handle = self._device_registry.get(device_id)
+        if handle is not None:
+            handle.set_mow_path_fetch_enabled(value=enabled)
+
+    def set_full_map_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
+        """Toggle the MQTT-side full map fetch gate for a registered device.
+
+        When False, ``start_map_sync`` runs MapFetchSaga in area-names-only mode
+        for sends that would go over MQTT.  BLE-routed syncs always run the full
+        fetch.
+        """
+        handle = self._device_registry.get(device_id)
+        if handle is not None:
+            handle.set_full_map_fetch_enabled(value=enabled)
 
     # ------------------------------------------------------------------
     # Properties

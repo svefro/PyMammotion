@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ import random
 import time
 from typing import Any, TypeVar, cast
 
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientError, ClientSession, ClientTimeout
 import jwt
 
 from pymammotion.const import (
@@ -86,7 +87,9 @@ def sign_with_hmac_sha256(data: str, app_secret: str) -> str:
         raise RuntimeError(f"toSignWithHmacSha256 error: {e}") from e
 
 
-def create_oauth_signature(login_req: dict, client_id: str, client_secret: str, token_endpoint: str) -> str:
+def create_oauth_signature(
+    login_req: dict, client_id: str, client_secret: str, token_endpoint: str, timestamp: int
+) -> str:
     """Create OAuth signature for login request.
 
     Args:
@@ -97,13 +100,11 @@ def create_oauth_signature(login_req: dict, client_id: str, client_secret: str, 
 
     Returns:
         HMAC-SHA256 signature
+        :param timestamp:
 
     """
     # Convert dict to JSON without HTML escaping (ensure_ascii=False handles this)
     json_data = json.dumps(login_req, ensure_ascii=False, separators=(",", ":"))
-
-    # Get current timestamp in milliseconds
-    timestamp = str(int(time.time() * 1000))
 
     # Construct the string to sign
     str_to_sign = f"{client_id}{timestamp}{token_endpoint}{json_data}"
@@ -144,7 +145,7 @@ class MammotionHTTP:
         self._response: Response | None = None
         self._login_info: LoginResponseData | None = None
         self.jwt_info: JWTTokenInfo = JWTTokenInfo("", "")
-        app_version = f"HA,2.{ha_version}" if ha_version else f"ALIYUN DEMO,{APP_VERSION}"
+        app_version = f"HA,2.{ha_version}" if ha_version else f"NOT HA,{APP_VERSION}"
         # app_version = f"ALIYUN DEMO,{APP_VERSION}"  # f"HA,{ha_version}"
         self._headers = {"User-Agent": "okhttp/4.9.3", "App-Version": app_version}
         self.encryption_utils = EncryptionUtils()
@@ -209,6 +210,31 @@ class MammotionHTTP:
     def generate_headers(token: str) -> dict:
         """Generate Authorization headers for the given bearer token."""
         return {"Authorization": f"Bearer {token}"}
+
+    @staticmethod
+    def retry_on_network_error(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        """Retry a method up to 3 times on transient network errors.
+
+        Catches aiohttp.ClientError and asyncio.TimeoutError between attempts.
+        Auth failures and application errors are never retried.
+        """
+        _MAX_ATTEMPTS = 3
+        _RETRY_DELAYS = (1.0, 2.0)
+
+        @wraps(func)
+        async def wrapper(self: MammotionHTTP, *args: Any, **kwargs: Any) -> T:
+            last_exc: Exception = RuntimeError("no attempts made")
+            for attempt in range(_MAX_ATTEMPTS):
+                if attempt > 0:
+                    await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+                try:
+                    return await func(self, *args, **kwargs)
+                except (ClientError, asyncio.TimeoutError) as exc:
+                    last_exc = exc
+                    _LOGGER.debug("Network error on attempt %d/%d: %s", attempt + 1, _MAX_ATTEMPTS, exc)
+            raise last_exc
+
+        return wrapper
 
     @staticmethod
     def refresh_token_decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
@@ -560,6 +586,7 @@ class MammotionHTTP:
 
         return Response(code=200, msg="success")
 
+    @retry_on_network_error
     @refresh_token_decorator
     async def get_mqtt_credentials(self) -> Response[MQTTConnection]:
         """Get mammotion mqtt credentials"""
@@ -682,6 +709,8 @@ class MammotionHTTP:
     async def refresh_token_v2(self) -> Response[LoginResponseData]:
         """Refresh token v2."""
 
+        timestamp = int(time.time() * 1000)
+
         refresh_request = {
             "client_id": MAMMOTION_OAUTH2_CLIENT_ID,
             "refresh_token": self._require_login_info.refresh_token,
@@ -693,6 +722,7 @@ class MammotionHTTP:
             client_id=MAMMOTION_OAUTH2_CLIENT_ID,
             client_secret=MAMMOTION_OAUTH2_CLIENT_SECRET,
             token_endpoint="/oauth2/token",
+            timestamp=timestamp,
         )
 
         async with self._client_session() as session:
@@ -701,7 +731,7 @@ class MammotionHTTP:
                 headers={
                     **self._headers,
                     "Ma-Iot-Signature": oauth_signature,
-                    "Ma-Timestamp": str(int(time.time())),
+                    "Ma-Timestamp": str(timestamp),
                     "Client-Id": self.client_id,
                     "Client-Type": "1",
                 },
@@ -728,6 +758,8 @@ class MammotionHTTP:
         self.account = account
         self._password = password
 
+        timestamp = int(time.time() * 1000)
+
         login_request = {
             "username": account,
             "password": base64.b64encode(password.encode("utf-8")).decode("utf-8"),
@@ -741,6 +773,7 @@ class MammotionHTTP:
             client_id=MAMMOTION_OAUTH2_CLIENT_ID,
             client_secret=MAMMOTION_OAUTH2_CLIENT_SECRET,
             token_endpoint="/oauth2/token",
+            timestamp=timestamp,
         )
 
         async with self._client_session() as session:
@@ -750,7 +783,7 @@ class MammotionHTTP:
                     **self._headers,
                     "Ma-App-Key": MAMMOTION_OAUTH2_CLIENT_ID,
                     "Ma-Signature": oauth_signature,
-                    "Ma-Timestamp": str(int(time.time())),
+                    "Ma-Timestamp": str(timestamp),
                     "Client-Id": self.client_id,
                     "Client-Type": "1",
                 },

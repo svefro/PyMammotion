@@ -17,6 +17,9 @@
 
 PyMammotion is a Python API for controlling and monitoring Mammotion devices (Luba, Yuka, spino etc) via MQTT, Cloud, and Bluetooth.
 
+> [!WARNING]
+> **Use at your own risk.** Mammotion's Terms of Service prohibit unofficial API access. Using this library may result in a **permanent ban of your Mammotion account**. The authors are not responsible for any consequences, including loss of access to your device or account.
+
 ⚠️ **Please note:** This API is still under active development. You may encounter unfinished features or bugs. If you come across any issues, please open an issue on the GitHub repository. 🐛
 
 ## Home Assistant Integration

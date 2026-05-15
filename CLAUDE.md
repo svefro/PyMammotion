@@ -19,8 +19,8 @@ uv sync
 uv run ruff check --fix pymammotion/
 uv run ruff format pymammotion/
 
-# Type checking (excludes proto/, tests/, scripts/, linkkit/)
-uv run mypy pymammotion/
+# Type checking (excludes proto/, tests/, scripts/, linkkit/ — configured in pyproject.toml [tool.ty])
+uv run ty check pymammotion/
 
 # Additional linting
 uv run pylint pymammotion/
@@ -154,8 +154,7 @@ Key files for protocol/logic research:
 - **Python version:** 3.12+
 - **Type stubs** for missing third-party types are in `stubs/`
 - Ruff excludes `pymammotion/proto/`, `tests/`, and `scripts/` from linting
-- mypy excludes `pymammotion/proto/`, `tests/`, `scripts/`, and `pymammotion/mqtt/linkkit/`
-- Strict mypy config: `disallow_untyped_defs`, `disallow_untyped_calls`, `disallow_any_generics`
+- ty excludes `pymammotion/proto/**`, `tests/**`, `scripts/**`, `examples/**`, and `pymammotion/mqtt/linkkit/**`
 - **No local imports inside function bodies** — always use top-level imports. Exception: `TYPE_CHECKING` guards for type-hint-only imports that would cause circular imports at runtime.
 
 ## Working in this codebase (rules for Claude)

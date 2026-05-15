@@ -388,6 +388,22 @@ class HashList(DataClassORJSONMixin):
             if root_list.sub_cmd == 0
         ]
 
+    @property
+    def computed_bol_hash(self) -> int:
+        """Compute the map's bol_hash from locally stored area hash IDs.
+
+        Mirrors the APK's ``HashDataManager.getDBCmHash()``, which MurMur-hashes
+        the list of all locally stored MapElement hashes.  When our stored area
+        hashes are in sync with the device, this value equals the device's
+        reported ``bol_hash`` in ``report_data.locations[0].bol_hash``.
+
+        Returns 0 when no area hashes have been fetched yet.
+        """
+        hashes = [h for h in self.area_root_hashlist if h != 0]
+        if not hashes:
+            return 0
+        return int(MurMurHashUtil.hash_unsigned_list(hashes))
+
     def missing_hashlist(self, sub_cmd: int = 0) -> list[int]:
         """Return hash IDs declared in ``root_hash_lists`` for *sub_cmd* but not yet fetched."""
         all_hash_ids = set(self.area.keys()).union(
@@ -739,21 +755,21 @@ class HashList(DataClassORJSONMixin):
         be preserved — the device advances ub_path_hash through segments during
         a mow and wiping on every change would discard live data.
         """
-        if path_hash == 0 or path_hash == 1:
+        if path_hash in (0, 1):
             self.current_mow_path = {}
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.last_ub_path_hash = 0
 
-    def has_mow_path_for_hash(self, ub_path_hash: int) -> bool:
-        """Return True if cover-path data for *ub_path_hash* is already cached.
+    def has_mow_path_for_hash(self, path_hash: int) -> bool:
+        """Return True if cover-path data for *path_hash* is already cached.
 
         Matches against ``path_packets[0].path_hash`` in any transaction's first
-        frame — the device uses ub_path_hash to identify the active segment.
+        frame — equals ``work.path_hash`` (field 2) when the cached data is current.
         """
         for frames in self.current_mow_path.values():
             for mow_path in frames.values():
-                if mow_path.path_packets and mow_path.path_packets[0].path_hash == ub_path_hash:
+                if mow_path.path_packets and mow_path.path_packets[0].path_hash == path_hash:
                     return True
         return False
 

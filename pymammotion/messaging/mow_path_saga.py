@@ -119,17 +119,21 @@ class MowPathSaga(Saga):
                     ack_response = await asyncio.wait_for(hash_ack_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
                     if _total_frame == 0:
+                        # Device gave no response at all — no active breakpoint lines.
+                        # Treat as empty and fall through to the zone_hashs fallback
+                        # at the sub_cmd=3 check below.
                         _logger.warning(
-                            "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)",
+                            "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)"
+                            " — treating as empty and continuing",
                             self._device_name,
                         )
-                    else:
-                        _logger.warning(
-                            "collecting mow path [%s]: line hash list interrupted at frame %d/%d",
-                            self._device_name,
-                            _current_frame,
-                            _total_frame,
-                        )
+                        break
+                    _logger.warning(
+                        "collecting mow path [%s]: line hash list interrupted at frame %d/%d",
+                        self._device_name,
+                        _current_frame,
+                        _total_frame,
+                    )
                     raise CommandTimeoutError("toapp_gethash_ack(sub_cmd=3)", 1) from None
 
                 ack = ack_response.nav.toapp_gethash_ack
@@ -181,19 +185,14 @@ class MowPathSaga(Saga):
         # Combine all frames' hashes into one flat list, then split into batches of 20.
         _sub3 = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 3), None)
         if _sub3 is None or not _sub3.data:
-            confirmed_zone_hashs = (
-                [h for h in self._route_val.zone_hashs if h != 0] if self._route_val is not None else []
-            ) or self._zone_hashs
-            _logger.warning(
-                "MowPathSaga: no sub_cmd=3 hash list in map — falling back to zone_hashs=%s",
-                confirmed_zone_hashs,
-            )
-            all_hashes = confirmed_zone_hashs
-        else:
-            all_hashes = [
-                h for frame in sorted(_sub3.data, key=lambda d: d.current_frame) for h in frame.data_couple if h != 0
-            ]
-            _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
+            # No breakpoint lines from sub_cmd=3 — nothing to fetch via get_line_info_list.
+            _logger.debug("MowPathSaga: no sub_cmd=3 line hashes — no cover path to fetch")
+            self._route_val = None
+            return
+        all_hashes = [
+            h for frame in sorted(_sub3.data, key=lambda d: d.current_frame) for h in frame.data_couple if h != 0
+        ]
+        _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
 
         _BATCH_SIZE = 20
         hash_batches = [all_hashes[i : i + _BATCH_SIZE] for i in range(0, len(all_hashes), _BATCH_SIZE)]

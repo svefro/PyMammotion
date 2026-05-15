@@ -16,11 +16,14 @@ repos:
         types: [ python ]
         args: [ --safe ]
         files: ^((pymammotion)/.+)?[^/]+\.(py|pyi)$
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: ''  # Use the sha / tag you want to point at
+  - repo: local
     hooks:
-      - id: mypy
-        exclude: ^(pymammotion/proto/|tests/|scripts/|examples/)
+      - id: ty
+        name: ty
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
+        always_run: true
 
   - repo: local
     hooks:

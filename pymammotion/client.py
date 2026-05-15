@@ -117,6 +117,26 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+def _should_fetch_mow_path(device: MowerDevice, handle: DeviceHandle, path_hash: int) -> bool:
+    """Return True if a MowPathSaga should be triggered.
+
+    Mirrors the APK's HashDataManager.updateTotalHash() gate logic:
+    - Not in firmware-update mode (DeviceWorkState.MODE_UPDATING == 16).
+    - No saga already running (!isUpdateMap / is_saga_active).
+    - path_hash (work field 2 = work.getPathHash()) is non-zero.
+    - Device's current bol_hash matches our computed_bol_hash (j == getDBCmHash())
+      — prevents fetching cover paths against a stale map.
+    """
+    if device.report_data.dev.sys_status == WorkMode.MODE_UPDATING:
+        return False
+    if handle.queue.is_saga_active:
+        return False
+    if path_hash == 0:
+        return False
+    current_bol_hash = device.report_data.locations[0].bol_hash if device.report_data.locations else 0
+    return current_bol_hash != 0 and current_bol_hash == device.map.computed_bol_hash
+
+
 class MammotionClient:
     """Top-level client — stable HA-facing API for the new architecture."""
 
@@ -190,8 +210,9 @@ class MammotionClient:
 
         Installs field watchers on the device handle:
 
-        * ``(ub_path_hash, path_hash)`` — fires ``MowPathSaga`` (fetch-only)
-          when either hash transitions to an active value while no cover path
+        * ``path_hash`` (work field 2) — fires ``MowPathSaga`` (fetch-only)
+          when the hash transitions to a non-zero value, our map is current
+          (computed_bol_hash == device bol_hash), and no matching cover path
           is cached.
         * ``(path_pos_x, path_pos_y)`` — rebuilds ``generated_mow_progress_geojson``
           as the mower progresses along the path.
@@ -212,30 +233,19 @@ class MammotionClient:
         if handle is None:
             return None
 
-        async def _on_path_hashes_changed(_hashes: tuple[int, int]) -> None:
+        async def _on_path_hashes_changed(path_hash: int) -> None:
             device = cast(MowerDevice, handle.snapshot.raw)
-            work = device.report_data.work
-            # path_hash in (0, 1) means "no job" / "job ended".
-            has_active_job = work.ub_path_hash != 0 or work.path_hash not in (0, 1)
-            if not has_active_job:
-                return
+            if device.map.current_mow_path and device.map.has_mow_path_for_hash(path_hash):
+                return  # Cache is valid for the current route
             if device.map.current_mow_path:
-                # Cache exists — validate it against the current active segment hash.
-                # ub_path_hash appears directly as path_packets[0].path_hash inside the
-                # cover-path frames (confirmed via APK HashDataManager and device data).
-                # If ub_path_hash is 0 we can't validate a specific segment, so keep.
-                if work.ub_path_hash == 0 or device.map.has_mow_path_for_hash(work.ub_path_hash):
-                    return  # Cache is valid for the current job segment
-                # Cache exists but doesn't contain the current segment — stale.
-                # Clear it so the saga fetches fresh data below.
+                # Cache exists but for a different route — clear it before fetching.
                 device.map.invalidate_mow_path(0)
-            if handle.queue.is_saga_active:
+            if not _should_fetch_mow_path(device, handle, path_hash):
                 return
             _logger.debug(
-                "Device %s path_hash=%d ub_path_hash=%d — auto-fetching cover path",
+                "Device %s path_hash=%d — auto-fetching cover path",
                 device_name,
-                work.path_hash,
-                work.ub_path_hash,
+                path_hash,
             )
             try:
                 current_work = GenerateRouteInformation.from_current_task_settings(device.work)
@@ -272,7 +282,7 @@ class MammotionClient:
                 _logger.warning("Auto-trigger map sync failed for %s", device_name, exc_info=True)
 
         sub = handle.watch_field(
-            lambda s: (s.raw.report_data.work.ub_path_hash, s.raw.report_data.work.path_hash),
+            lambda s: s.raw.report_data.work.path_hash,
             _on_path_hashes_changed,
         )
         progress_sub = handle.watch_field(
@@ -1574,18 +1584,6 @@ class MammotionClient:
 
         if handle := self._device_registry.get_by_name(device_name):
             commands = handle.commands
-            # MQTT-only gate: when full_map_fetch_enabled is False AND BLE isn't
-            # actively connected (so this would go over MQTT), downgrade to
-            # area-names-only mode.  BLE-routed syncs always run the full fetch.
-            mqtt_only_run = not handle.is_transport_connected(TransportType.BLE)
-            area_names_only = mqtt_only_run and not handle.full_map_fetch_enabled
-            existing_area_hashes: list[int] | None = None
-            if area_names_only:
-                existing_area_hashes = sorted(cast(MowerDevice, handle.snapshot.raw).map.area.keys())
-                _logger.debug(
-                    "start_map_sync '%s': full_map_fetch_enabled=False over MQTT — area-names-only mode",
-                    device_name,
-                )
             saga = MapFetchSaga(
                 device_id=handle.device_id,
                 device_name=handle.device_name,
@@ -1593,8 +1591,6 @@ class MammotionClient:
                 command_builder=commands,
                 send_command=handle.send_raw,
                 get_map=lambda: cast(MowerDevice, handle.snapshot.raw).map,
-                area_names_only=area_names_only,
-                existing_area_hashes=existing_area_hashes,
             )
 
             async def _on_map_complete() -> None:
@@ -1647,27 +1643,16 @@ class MammotionClient:
         if handle := self._device_registry.get_by_name(device_name):
             device = cast(MowerDevice, handle.snapshot.raw)
             work = device.report_data.work
-            # path_hash in (0, 1) means "no job" / "job ended".
-            has_active_job = work.ub_path_hash != 0 or work.path_hash not in (0, 1)
-            if not has_active_job:
-                return
+            if device.map.current_mow_path and device.map.has_mow_path_for_hash(work.path_hash):
+                return  # Cache is valid for the current route
             if device.map.current_mow_path:
-                # Cache exists — validate it against the current active segment hash.
-                # ub_path_hash appears directly as path_packets[0].path_hash inside the
-                # cover-path frames (confirmed via APK HashDataManager and device data).
-                # If ub_path_hash is 0 we can't validate a specific segment, so keep.
-                if work.ub_path_hash == 0 or device.map.has_mow_path_for_hash(work.ub_path_hash):
-                    return  # Cache is valid for the current job segment
-                # Cache exists but doesn't contain the current segment — stale.
-                # Clear it so the saga fetches fresh data below.
                 device.map.invalidate_mow_path(0)
-            if handle.queue.is_saga_active:
+            if not _should_fetch_mow_path(device, handle, work.path_hash):
                 return
             _logger.debug(
-                "Device %s path_hash=%d ub_path_hash=%d — auto-fetching cover path",
+                "Device %s path_hash=%d — auto-fetching cover path",
                 device_name,
                 work.path_hash,
-                work.ub_path_hash,
             )
             try:
                 current_work = GenerateRouteInformation.from_current_task_settings(device.work)
@@ -1697,15 +1682,6 @@ class MammotionClient:
         from pymammotion.messaging.mow_path_saga import MowPathSaga
 
         if handle := self._device_registry.get_by_name(device_name):
-            # MQTT-only gate: skip when mow_path_fetch_enabled is False AND BLE
-            # isn't actively connected (so this would go over MQTT).  BLE-routed
-            # fetches always run.
-            if not handle.mow_path_fetch_enabled and not handle.is_transport_connected(TransportType.BLE):
-                _logger.debug(
-                    "start_mow_path_saga '%s': mow_path_fetch_enabled=False over MQTT — skipping",
-                    device_name,
-                )
-                return
             saga = MowPathSaga(
                 command_builder=handle.commands,
                 send_command=handle.send_raw,
@@ -2134,28 +2110,6 @@ class MammotionClient:
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_prefer_ble(value=prefer_ble)
-
-    def set_mow_path_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
-        """Toggle the MQTT-side mow path fetch gate for a registered device.
-
-        When False, MowPathSaga is skipped (auto-trigger and explicit
-        ``start_mow_path_saga``) for any send that would go over MQTT.  BLE
-        sends always run regardless — local link, no cloud quota concern.
-        """
-        handle = self._device_registry.get(device_id)
-        if handle is not None:
-            handle.set_mow_path_fetch_enabled(value=enabled)
-
-    def set_full_map_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
-        """Toggle the MQTT-side full map fetch gate for a registered device.
-
-        When False, ``start_map_sync`` runs MapFetchSaga in area-names-only mode
-        for sends that would go over MQTT.  BLE-routed syncs always run the full
-        fetch.
-        """
-        handle = self._device_registry.get(device_id)
-        if handle is not None:
-            handle.set_full_map_fetch_enabled(value=enabled)
 
     # ------------------------------------------------------------------
     # Properties

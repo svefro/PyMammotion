@@ -27,7 +27,7 @@ Description:
         {base_topic}/devices/{device_id}/get_stream_subscription
         
         {base_topic}/devices/global/get_error_info  (publishes to {base_topic}/error_info/{language_code}/{error_code})
-        {base_topic}/devices/global/kill
+        {base_topic}/devices/global/kill (payload must be kill)
         
     Payload is json.
 
@@ -409,12 +409,13 @@ class ExternalMQTTPublisher:
             elif command == "get_error_info":
                 await self._execute_get_error_info(cmd_data)   
             elif command == "kill":
-                _LOGGER.warning("Killing app")
-                await self.client.publish(f"{self.base_topic}/mammotion2mqtt/status", payload="kill", retain=True)
-                await asyncio.sleep(3)
-                self._listener_task.cancel()
-                #sys.exit(0)
-                os._exit(0) # hard exit
+                if payload == "kill":
+                    _LOGGER.warning("Killing app")
+                    await self.client.publish(f"{self.base_topic}/mammotion2mqtt/status", payload="kill", retain=True)
+                    await asyncio.sleep(3)
+                    self._listener_task.cancel()
+                    #sys.exit(0)
+                    os._exit(0) # hard exit
             else:
                 _LOGGER.warning("Unknown command: %s", command)
 
@@ -776,7 +777,7 @@ class ExternalMQTTPublisher:
             "availableTime": res.data.availableTime
         }
         await self.publish(
-            f"{self.base_topic}/stream_subscription/{device_id}",
+            f"{self.base_topic}/devices/{device_id}/stream_subscription_json",
             payload=pars_dict,
             retain=True,
         )
@@ -790,17 +791,17 @@ class ExternalMQTTPublisher:
     async def _agora_stream_command(self, device_name: str, enter_state: int) -> None:
         if not self.dev_console:
             return
-        handle = self.dev_console.mammotion.device_registry.get_by_name(device_name)
-        if handle is None:
-            await self._send_response(device_name, "agora_stream_command", "error", error="Device not found")
-            return
         
+        
+
+
         try:
-            # Add timeout to prevent hanging
-            await asyncio.wait_for(
-                handle.device_agora_join_channel_with_position(enter_state=enter_state),
-                timeout=30.0
-            )
+            
+            print("Sending agora stream command with enter_state=%d for device %s", enter_state, device_name)
+
+            print("i have no idea of how to do this yet. Could you help?")
+
+
             await self._send_response(device_name, "agora_stream_command", "success")
             _LOGGER.info("✓ agora_stream_command executed: %s (enter_state=%d)", device_name, enter_state)
         except asyncio.TimeoutError:

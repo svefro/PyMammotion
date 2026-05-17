@@ -792,14 +792,17 @@ class ExternalMQTTPublisher:
         if not self.dev_console:
             return
         
-        
+        handle = self.dev_console.mammotion.device_registry.get_by_name(device_name)
+        if handle is None:
+            await self._send_response(device_name, "agora_stream_command", "error", error="Device not found")
+            return
 
 
         try:
-            
             print("Sending agora stream command with enter_state=%d for device %s", enter_state, device_name)
 
-            print("i have no idea of how to do this yet. Could you help?")
+            #handle.commands.device_agora_join_channel_with_position(enter_state=enter_state)
+            print("i have no idea of how to do this yet. Could you help?, i can get the stream working, but i have to open the stream in the app to get the mower to start streaming")
 
 
             await self._send_response(device_name, "agora_stream_command", "success")

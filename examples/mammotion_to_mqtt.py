@@ -376,7 +376,7 @@ class ExternalMQTTPublisher:
                     cmd_data = json.loads(payload)
                 except json.JSONDecodeError:
                     _LOGGER.warning("Invalid JSON in command payload: %s", payload)
-                    return
+                    #return
 
             _LOGGER.info(
                 "[bold yellow]→ MQTT Command[/bold yellow]  [cyan]%s[/cyan]  [green]%s[/green]",
@@ -410,7 +410,7 @@ class ExternalMQTTPublisher:
                 await self._execute_get_error_info(cmd_data)   
             elif command == "kill":
                 if payload == "kill":
-                    _LOGGER.warning("Killing app")
+                    _LOGGER.warning("Killing app in 3 seconds. App might restart if running in a container")
                     await self.client.publish(f"{self.base_topic}/mammotion2mqtt/status", payload="kill", retain=True)
                     await asyncio.sleep(3)
                     self._listener_task.cancel()
@@ -1085,7 +1085,6 @@ async def _main(args: argparse.Namespace) -> None:
     )
 
 
-    #await main_loop.gat
 
     def _run_idle_loop():
         import time
@@ -1094,8 +1093,7 @@ async def _main(args: argparse.Namespace) -> None:
 
         while True:
             print("Alive. DateTime: " + str(datetime.datetime.now()))
-            #print("Alive minute counter " + str(counter))
-            #counter = counter + 1
+
             time.sleep(60)
 
     def _start_repl() -> None:

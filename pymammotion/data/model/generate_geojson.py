@@ -33,6 +33,7 @@ layer shape that the HA-Mammotion-Assets icon pack consumes.
 import json
 import logging
 import math
+from pathlib import Path
 from typing import Any, ClassVar
 
 from shapely.geometry import Point
@@ -303,7 +304,7 @@ class GeojsonGenerator:
 
     @staticmethod
     def apply_meter_offsets(lon: float, lat: float, lon_offset: float, lat_offset: float) -> list[float]:
-        """Apply meter-based offsets to coordinates (in degrees)"""
+        """Apply meter-based offsets to coordinates (in degrees)."""
         new_lon = lon + (lon_offset / (METERS_PER_DEGREE * math.cos(math.radians(lat))))
         new_lat = lat + (lat_offset / METERS_PER_DEGREE)
         return [new_lon, new_lat]
@@ -327,7 +328,7 @@ class GeojsonGenerator:
 
         geo_json: GeoJSONCollection = {"type": "FeatureCollection", "name": "Lawn Areas", "features": []}
         GeojsonGenerator._add_rtk_and_dock(rtk_location, dock_location, dock_rotation, geo_json)
-        total_frames = GeojsonGenerator._process_map_objects(hash_list, rtk_location, area_names, geo_json, yaw=yaw)
+        GeojsonGenerator._process_map_objects(hash_list, rtk_location, area_names, geo_json, yaw=yaw)
         GeojsonGenerator._process_svg_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
 
         # _save_geojson(geo_json)
@@ -338,7 +339,7 @@ class GeojsonGenerator:
         """Generate GeoJSON from hash list data."""
         geo_json: GeoJSONCollection = {"type": "FeatureCollection", "name": "Mowing Lawn Areas", "features": []}
 
-        total_frames = GeojsonGenerator._process_mow_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
+        GeojsonGenerator._process_mow_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
         return geo_json
 
     @staticmethod
@@ -500,7 +501,7 @@ class GeojsonGenerator:
         for path_hash in sorted(points_by_hash.keys(), key=_hash_order):
             all_points = points_by_hash[path_hash]
             total = len(all_points)
-            is_active = ub_path_hash == 0 or path_hash == ub_path_hash
+            is_active = ub_path_hash in (0, path_hash)
 
             if is_active:
                 if path_pos is not None and (path_pos[0] != 0.0 or path_pos[1] != 0.0):
@@ -676,7 +677,7 @@ class GeojsonGenerator:
         """
         total_frames = 0
 
-        for transaction_id, frames_by_index in hash_list.current_mow_path.items():
+        for frames_by_index in hash_list.current_mow_path.values():
             if not frames_by_index:
                 continue
 
@@ -714,7 +715,7 @@ class GeojsonGenerator:
         return total_frames
 
     @staticmethod
-    def _svg_bounding_box(svg: SvgMessage, yaw: float) -> list[CommDataCouple]:
+    def _svg_bounding_box(svg: SvgMessage, _yaw: float) -> list[CommDataCouple]:
         """Return the four corners of an SVG tile's rotated bounding box in device-local ENU metres.
 
         The box is centred at (x_move, y_move), has physical dimensions
@@ -999,7 +1000,7 @@ class GeojsonGenerator:
 
     @staticmethod
     def _create_mow_path_feature(
-        path_packet_list: MowPath, path_type: int, lonlat_coords: CoordinateList, length: float, area: float
+        path_packet_list: MowPath, path_type: int, lonlat_coords: CoordinateList, length: float, _area: float
     ) -> GeoJSONFeature | None:
         """Create a GeoJSON feature for a mow path, styled by path_type.
 
@@ -1121,7 +1122,7 @@ class GeojsonGenerator:
             geoJSON: GeoJSON collection to save
 
         """
-        with open("areas.json", "w") as json_file:
+        with Path("areas.json").open("w") as json_file:
             json.dump(geoJSON, json_file, indent=2)
 
     @staticmethod
